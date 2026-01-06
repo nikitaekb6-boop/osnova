@@ -1444,7 +1444,7 @@ async def queue_button_handler(callback: CallbackQuery):
 
 @dp.message(Command("give"))
 async def give_cmd(message: types.Message):
-    """Команда /give - сдать номер"""
+    """Команда /give - сдать номер (только Казахстан)"""
     if db.is_user_banned(message.from_user.id): 
         return
     
@@ -1468,8 +1468,12 @@ async def give_cmd(message: types.Message):
     
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")])
     
-    await message.answer("💰 **Выберите тип сдачи номера:**", 
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await message.answer(
+        "💰 *Выберите тип сдачи номера:*\n\n"
+        "🇰🇿 *Принимаются только номера Казахстана*\n"
+        "Формат: +7XXXXXXXXXX, 8XXXXXXXXXX или 7XXXXXXXXXX",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
 
 @dp.callback_query(F.data == "give_number")
 async def give_number_button_handler(callback: CallbackQuery):
@@ -3769,6 +3773,62 @@ async def reply_send_handler(message: types.Message, state: FSMContext):
 # ============================================
 # ОБРАБОТЧИКИ ВЫБОРА ТАРИФА И ВВОДА НОМЕРА
 # ============================================
+@dp.message(Form.waiting_for_number)
+async def number_input_handler(message: types.Message, state: FSMContext):
+    """Обработка введенного номера с проверкой формата Казахстана"""
+    is_closed, closed_message = db.is_system_closed()
+    if is_closed:
+        await message.answer(closed_message, reply_markup=get_main_menu(), parse_mode="None")
+        await state.clear()
+        return
+    
+    phone = message.text.strip()
+    
+    # Проверка формата номера Казахстана
+    import re
+    
+    # Форматы номеров Казахстана:
+    # +7XXXXXXXXXX (11 цифр с кодом +7)
+    # 8XXXXXXXXXX (11 цифр с кодом 8)
+    # 7XXXXXXXXXX (11 цифр с кодом 7)
+    # Также поддерживаем форматы с разделителями: +7 XXX XXX XXXX, 8 XXX XXX XXXX и т.д.
+    
+    # Убираем все нецифровые символы
+    digits_only = re.sub(r'\D', '', phone)
+    
+    # Проверяем длину номера
+    if len(digits_only) == 11:
+        # Проверяем код страны/оператора
+        if digits_only.startswith('77') or digits_only.startswith('87') or digits_only.startswith('76') or digits_only.startswith('70'):
+            # Номер начинается с кодов Казахстана
+            data = await state.get_data()
+            db.add_number(message.from_user.id, phone, data['tariff_id'], data['is_priority'])
+            
+            _, p_name = db.get_priority_settings()
+            text = "✅ *Номер добавлен в очередь!*"
+            if data['is_priority']:
+                text = f"⭐ *{p_name} номер добавлен в начало очереди!*"
+            
+            # Показываем нормализованный номер для информации
+            normalized_number = f"+7{digits_only[1:]}"  # Преобразуем в международный формат
+            await message.answer(
+                f"{text}\n\n"
+                f"📱 *Номер:* {normalized_number}\n"
+                f"🇰🇿 *Страна:* Казахстан",
+                reply_markup=get_main_menu(),
+                parse_mode="None"
+            )
+            
+            # Уведомление админов
+            for admin_id in ADMIN_IDS:
+                try:
+                    alert = f"🔔 *СРОЧНО: {p_name}!\n" if data['is_priority'] else "🔔 **Новый номер!*\n"
+                    safe_phone = escape_markdown(phone)
+                    await bot.send_message(admin_id, f"{alert}📞 {safe_phone}\n🇰🇿 Казахстан\nНажмите /number", parse_mode="None")
+                except: 
+                    pass
+            await state.clear()
+            return
 
 @dp.callback_query(F.data.startswith("tariff_"))
 async def tariff_select_handler(callback: CallbackQuery, state: FSMContext):
@@ -3784,16 +3844,15 @@ async def tariff_select_handler(callback: CallbackQuery, state: FSMContext):
     data = callback.data.split("_")
     await state.update_data(tariff_id=data[1], is_priority=int(data[2]))
     await state.set_state(Form.waiting_for_number)
-    await callback.message.edit_text("✏️ **Введите номер телефона**\n\nФормат: +7XXXXXXXXXX или 8XXXXXXXXXX:")
-
-@dp.message(Form.waiting_for_number)
-async def number_input_handler(message: types.Message, state: FSMContext):
-    """Обработка введенного номера"""
-    is_closed, closed_message = db.is_system_closed()
-    if is_closed:
-        await message.answer(closed_message, reply_markup=get_main_menu(), parse_mode="None")
-        await state.clear()
-        return
+    await callback.message.edit_text(
+        "✏️ *Введите номер телефона Казахстана*\n\n"
+        "📱 *Форматы:*\n"
+        "• +7XXXXXXXXXX (пример: +77012345678)\n"
+        "• 8XXXXXXXXXX (пример: 87012345678)\n"
+        "• 7XXXXXXXXXX (пример: 77012345678)\n\n"
+        "🇰🇿 *Только номера Казахстана!*\n"
+        "Коды операторов: 77, 87, 76, 70 и другие"
+    )
     
     phone = message.text.strip()
     data = await state.get_data()
@@ -4458,4 +4517,5 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+
     asyncio.run(main())
