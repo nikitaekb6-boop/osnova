@@ -2197,6 +2197,19 @@ async def admin_take_fast_handler(callback: CallbackQuery):
         return
 
     n_id, phone, u_id, username, is_prio = number
+    
+    # Проверяем, не взят ли уже номер другим оператором
+    current_status = db.cursor.execute(
+        "SELECT status FROM numbers WHERE id = ?", 
+        (n_id,)
+    ).fetchone()
+    
+    if current_status and current_status[0] != 'Ожидание':
+        await callback.answer("⚠️ Этот номер уже взят другим оператором!", show_alert=True)
+        # Обновляем список номеров
+        await admin_take_fast_handler(callback)
+        return
+    
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Встал", callback_data=f"vstal_{n_id}"),
          InlineKeyboardButton(text="❌ Слет / Отстоял", callback_data=f"slet_{n_id}")],
@@ -3599,6 +3612,22 @@ async def vstal_handler(callback: CallbackQuery):
         return
     
     n_id = callback.data.split("_")[1]
+    
+    # Проверяем, не взят ли уже номер другим оператором
+    current_status = db.cursor.execute(
+        "SELECT status FROM numbers WHERE id = ?", 
+        (n_id,)
+    ).fetchone()
+    
+    if current_status and current_status[0] != 'Ожидание':
+        await callback.answer("⚠️ Этот номер уже взят другим оператором!", show_alert=True)
+        # Удаляем сообщение с номером, который уже занят
+        try:
+            await callback.message.delete()
+        except:
+            pass
+        return
+    
     number_info = db.set_number_vstal(n_id)  # Теперь возвращает полную информацию
     
     if number_info:
@@ -3639,6 +3668,18 @@ async def slet_handler(callback: CallbackQuery):
         return
     
     n_id = callback.data.split("_")[1]
+    
+    # Проверяем, может ли этот оператор завершить этот номер
+    # Получаем текущий статус номера
+    current_status = db.cursor.execute(
+        "SELECT status FROM numbers WHERE id = ?", 
+        (n_id,)
+    ).fetchone()
+    
+    # Если номер не "В работе", значит его уже кто-то завершил или он не был взят
+    if not current_status or current_status[0] != 'В работе':
+        await callback.answer("⚠️ Этот номер уже обработан или не был взят вами!", show_alert=True)
+        return
     
     # Определяем, является ли пользователь главным админом
     is_super_admin = user_id in ADMIN_IDS
@@ -3724,6 +3765,18 @@ async def err_handler(callback: CallbackQuery):
         return
     
     n_id = callback.data.split("_")[1]
+    
+    # Проверяем, может ли этот оператор удалить этот номер
+    current_status = db.cursor.execute(
+        "SELECT status FROM numbers WHERE id = ?", 
+        (n_id,)
+    ).fetchone()
+    
+    # Если номер уже обработан (не "Ожидание" и не "В работе"), не позволяем удалить
+    if current_status and current_status[0] not in ['Ожидание', 'В работе']:
+        await callback.answer("⚠️ Этот номер уже обработан и не может быть удален!", show_alert=True)
+        return
+    
     u_id = db.delete_number_with_error(n_id)
     
     if u_id:
