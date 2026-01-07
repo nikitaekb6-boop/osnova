@@ -1008,7 +1008,7 @@ class Database:
     def get_user_archive(self, user_id):
         """Получить архив номеров пользователя (только СЛЕТ или ОТСТОЯЛ без времени)"""
         return self.cursor.execute("""
-            SELECT n.phone, n.status, t.name  # Убрали n.finished_at из SELECT
+            SELECT n.phone, n.status, t.name
             FROM numbers n
             LEFT JOIN tariffs t ON n.tariff_id = t.id
             WHERE n.user_id = ? AND (n.status = 'ОТСТОЯЛ' OR n.status = 'СЛЕТ')
@@ -1396,10 +1396,10 @@ async def archive_cmd(message: types.Message):
         text = "📂 **Архив пуст**\n\nУ вас пока нет завершенных номеров."
     else:
         text = "📂 **История номеров** (последние 15):\n\n"
-        for i in data:
-            emo = "✅" if i[1] == "ОТСТОЯЛ" else "❌"
-            # Теперь используем только i[0] (телефон), i[1] (статус), i[2] (название тарифа)
-            text += f"{emo} `{i[0]}` | {i[2]} | {i[1]}\n"  # Убрано время
+        for row in data:
+            phone, status, tariff_name = row  # Распаковываем 3 элемента
+            emo = "✅" if status == "ОТСТОЯЛ" else "❌"
+            text += f"{emo} `{phone}` | {tariff_name} | {status}\n"
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
@@ -1419,10 +1419,10 @@ async def archive_button_handler(callback: CallbackQuery):
         text = "📂 **Архив пуст**\n\nУ вас пока нет завершенных номеров."
     else:
         text = "📂 **История номеров** (последние 15):\n\n"
-        for i in data:
-            emo = "✅" if i[1] == "ОТСТОЯЛ" else "❌"
-            # Теперь используем только i[0] (телефон), i[1] (статус), i[2] (название тарифа)
-            text += f"{emo} `{i[0]}` | {i[2]} | {i[1]}\n"  # Убрано время
+        for row in data:
+            phone, status, tariff_name = row  # Распаковываем 3 элемента
+            emo = "✅" if status == "ОТСТОЯЛ" else "❌"
+            text += f"{emo} `{phone}` | {tariff_name} | {status}\n"
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
