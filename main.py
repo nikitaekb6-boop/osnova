@@ -1034,6 +1034,56 @@ class Database:
             LIMIT ?
         """, (limit,)).fetchall()
 
+    def get_numbers_by_date(self, date_str=None, limit=10):
+        """Получить номера за определенную дату или все"""
+        if date_str:
+            query = """
+                SELECT n.phone, u.username, n.status, t.name, n.created_at
+                FROM numbers n
+                LEFT JOIN users u ON n.user_id = u.user_id
+                LEFT JOIN tariffs t ON n.tariff_id = t.id
+                WHERE DATE(n.created_at) = ?
+                ORDER BY n.created_at DESC
+                LIMIT ?
+            """
+            return self.cursor.execute(query, (date_str, limit)).fetchall()
+        else:
+            # Получить последние номера (как раньше)
+            return self.cursor.execute("""
+                SELECT n.phone, u.username, n.status, t.name, n.created_at
+                FROM numbers n
+                LEFT JOIN users u ON n.user_id = u.user_id
+                LEFT JOIN tariffs t ON n.tariff_id = t.id
+                ORDER BY n.created_at DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+
+    def get_all_numbers_by_date_raw(self, date_str=None):
+        """Получить все номера за определенную дату (для скачивания)"""
+        if date_str:
+            query = """
+                SELECT n.id, n.phone, u.username, n.status, t.name, n.created_at, n.finished_at
+                FROM numbers n 
+                LEFT JOIN users u ON n.user_id = u.user_id
+                LEFT JOIN tariffs t ON n.tariff_id = t.id
+                WHERE DATE(n.created_at) = ?
+                ORDER BY n.created_at DESC
+            """
+            return self.cursor.execute(query, (date_str,)).fetchall()
+        else:
+            # Все номера (как раньше)
+            return self.get_all_numbers_raw()
+
+    def get_available_dates(self):
+        """Получить список дат, за которые есть данные"""
+        return self.cursor.execute("""
+            SELECT DISTINCT DATE(created_at) as date 
+            FROM numbers 
+            WHERE created_at IS NOT NULL 
+            ORDER BY date DESC
+            LIMIT 30  -- последние 30 дней
+        """).fetchall()
+
     def get_user_position(self, user_id):
         target = self.cursor.execute("""
             SELECT created_at, is_priority 
@@ -1137,6 +1187,9 @@ class Form(StatesGroup):
     # Состояния для скрытой надбавки времени
     waiting_for_hidden_bonus_tariff = State()
     waiting_for_hidden_bonus_minutes = State()
+    # Состояния для выбора даты
+    waiting_for_date_selection = State()  # Выбор даты для просмотра базы
+    waiting_for_download_date = State()   # Выбор даты для скачивания базы
 
 # --- КЛАВИАТУРЫ ---
 
@@ -2436,49 +2489,300 @@ async def admin_take_fast_handler(callback: CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_base")
-async def admin_base_handler(callback: CallbackQuery):
-    """Кнопка базы номеров в админ-панели"""
+async def admin_base_handler(callback: CallbackQuery, state: FSMContext):
+    """Кнопка базы номеров в админ-панели с выбором даты"""
     user_id = callback.from_user.id
     if user_id not in ADMIN_IDS and not db.is_admin(user_id):
         await callback.answer("❌ У вас нет прав доступа", show_alert=True)
         return
     
-    nums = db.get_all_numbers_limit(10)
-    text = "📂 **Последние 10 номеров:**\n\n"
-    for n in nums:
-        safe_phone = escape_markdown(n[0])
-        safe_username = escape_markdown(n[1] or '—')
-        text += f"📞 `{safe_phone}` | 👤 @{safe_username} | 📊 {n[2]} | 📦 {n[3]}\n"
+    # Получаем список доступных дат
+    available_dates = db.get_available_dates()
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📥 Скачать полную базу (TXT)", callback_data="csv")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel_back")]
-    ])
+    text = "📂 **База номеров**\n\n"
+    text += "Выберите дату для просмотра или действие:"
     
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="None")
+    buttons = []
+    
+    # Кнопки для последних 5 дат
+    for i, (date_str,) in enumerate(available_dates[:5]):
+        # Форматируем дату в более читаемый вид
+        try:
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+            formatted_date = date_obj.strftime('%d.%m.%Y')
+            button_text = f"📅 {formatted_date}"
+        except:
+            button_text = f"📅 {date_str}"
+        
+        buttons.append([InlineKeyboardButton(
+            text=button_text, 
+            callback_data=f"view_date_{date_str}"
+        )])
+    
+    # Кнопка "Все номера"
+    buttons.append([InlineKeyboardButton(
+        text="📋 Все номера (последние 10)", 
+        callback_data="view_all_numbers"
+    )])
+    
+    # Кнопка "Скачать за дату"
+    buttons.append([InlineKeyboardButton(
+        text="📥 Скачать за дату", 
+        callback_data="download_by_date"
+    )])
+    
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel_back")])
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
 
-@dp.callback_query(F.data == "csv")
-async def csv_handler(callback: CallbackQuery):
-    """Скачать базу номеров"""
+@dp.callback_query(F.data == "view_all_numbers")
+async def view_all_numbers_handler(callback: CallbackQuery):
+    """Показать все номера (без фильтрации по дате)"""
     user_id = callback.from_user.id
     if user_id not in ADMIN_IDS and not db.is_admin(user_id):
         await callback.answer("❌ У вас нет прав доступа", show_alert=True)
         return
     
-    data = db.get_all_numbers_raw()
-    path = "base.txt"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("ID | Номер | Пользователь | Статус | Тариф | Создан | Завершен\n" + "-"*50 + "\n")
-        for row in data: 
-            f.write(" | ".join(map(str, row)) + "\n")
+    nums = db.get_numbers_by_date(limit=10)  # Без даты - последние 10
+    
+    if not nums:
+        text = "📭 **Нет номеров в базе**"
+    else:
+        text = "📂 **Последние 10 номеров:**\n\n"
+        for n in nums:
+            phone, username, status, tariff_name, created_at = n
+            safe_phone = escape_markdown(phone)
+            safe_username = escape_markdown(username or '—')
+            
+            # Форматируем дату
+            if created_at:
+                created_date = created_at.split()[0]
+                created_time = created_at.split()[1][:5]
+                date_display = f"{created_date} {created_time}"
+            else:
+                date_display = "—"
+            
+            text += f"📞 `{safe_phone}`\n👤 @{safe_username}\n📊 {status} | 📦 {tariff_name}\n🕐 {date_display}\n━━━━━━━━━━━━━━━━━━━━\n"
+    
+    buttons = [
+        [InlineKeyboardButton(text="📥 Скачать полную базу (TXT)", callback_data="csv_all")],
+        [InlineKeyboardButton(text="⬅️ Назад к выбору даты", callback_data="admin_base")]
+    ]
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+@dp.callback_query(F.data.startswith("view_date_"))
+async def view_date_handler(callback: CallbackQuery):
+    """Показать номера за определенную дату"""
+    user_id = callback.from_user.id
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
+        return
+    
+    date_str = callback.data.split("view_date_")[1]
     
     try:
-        await callback.message.answer_document(FSInputFile(path), caption="📂 База номеров (TXT)")
+        # Форматируем дату для отображения
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        formatted_date = date_obj.strftime('%d.%m.%Y')
+    except:
+        formatted_date = date_str
+    
+    nums = db.get_numbers_by_date(date_str, limit=20)
+    
+    if not nums:
+        text = f"📭 **Нет номеров за {formatted_date}**"
+    else:
+        # Подсчитываем статистику
+        total = len(nums)
+        status_counts = {}
+        for n in nums:
+            status = n[2]
+            status_counts[status] = status_counts.get(status, 0) + 1
+        
+        text = f"📂 **Номера за {formatted_date}**\n\n"
+        text += f"📊 **Статистика:** Всего {total} номеров\n"
+        
+        for status, count in status_counts.items():
+            text += f"  • {status}: {count}\n"
+        
+        text += "\n📋 **Последние 20 номеров:**\n\n"
+        
+        for i, n in enumerate(nums[:20], 1):
+            phone, username, status, tariff_name, created_at = n
+            safe_phone = escape_markdown(phone)
+            safe_username = escape_markdown(username or '—')
+            
+            if created_at:
+                created_time = created_at.split()[1][:5]
+                time_display = f"🕐 {created_time}"
+            else:
+                time_display = ""
+            
+            emoji = "✅" if status == "ОТСТОЯЛ" else "❌" if status == "СЛЕТ" else "⏳"
+            
+            text += f"{i}. {emoji} `{safe_phone}`\n"
+            text += f"   👤 @{safe_username} | {tariff_name} {time_display}\n"
+            
+            if i < len(nums[:20]):
+                text += "━━━━━━━━━━━━━━━━━━━━\n"
+    
+    buttons = [
+        [InlineKeyboardButton(text=f"📥 Скачать за {formatted_date}", callback_data=f"csv_date_{date_str}")],
+        [InlineKeyboardButton(text="⬅️ Назад к выбору даты", callback_data="admin_base")]
+    ]
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+@dp.callback_query(F.data == "download_by_date")
+async def download_by_date_handler(callback: CallbackQuery):
+    """Выбор даты для скачивания"""
+    user_id = callback.from_user.id
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
+        return
+    
+    # Получаем список доступных дат
+    available_dates = db.get_available_dates()
+    
+    if not available_dates:
+        await callback.answer("📭 Нет данных для скачивания", show_alert=True)
+        return
+    
+    text = "📥 **Скачать базу за дату**\n\nВыберите дату:"
+    
+    buttons = []
+    
+    # Кнопки для последних 10 дат
+    for i, (date_str,) in enumerate(available_dates[:10]):
+        try:
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+            formatted_date = date_obj.strftime('%d.%m.%Y')
+            button_text = f"📅 {formatted_date}"
+        except:
+            button_text = f"📅 {date_str}"
+        
+        buttons.append([InlineKeyboardButton(
+            text=button_text, 
+            callback_data=f"download_date_{date_str}"
+        )])
+    
+    buttons.append([InlineKeyboardButton(text="📥 Все номера", callback_data="csv_all")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_base")])
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+@dp.callback_query(F.data == "csv_all")
+async def csv_all_handler(callback: CallbackQuery):
+    """Скачать полную базу (все номера)"""
+    user_id = callback.from_user.id
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
+        return
+    
+    await csv_handler_general(callback, date_str=None)
+
+@dp.callback_query(F.data.startswith("csv_date_"))
+async def csv_date_handler(callback: CallbackQuery):
+    """Скачать базу за определенную дату"""
+    user_id = callback.from_user.id
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
+        return
+    
+    date_str = callback.data.split("csv_date_")[1]
+    await csv_handler_general(callback, date_str)
+
+@dp.callback_query(F.data.startswith("download_date_"))
+async def download_date_handler(callback: CallbackQuery):
+    """Скачать базу за определенную дату (из меню выбора даты)"""
+    user_id = callback.from_user.id
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
+        return
+    
+    date_str = callback.data.split("download_date_")[1]
+    await csv_handler_general(callback, date_str)
+
+async def csv_handler_general(callback: CallbackQuery, date_str=None):
+    """Общий обработчик для скачивания базы (с фильтром по дате или без)"""
+    user_id = callback.from_user.id
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
+        return
+    
+    # Получаем данные в зависимости от фильтра
+    if date_str:
+        data = db.get_all_numbers_by_date_raw(date_str)
+        try:
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+            formatted_date = date_obj.strftime('%d.%m.%Y')
+            file_date = date_obj.strftime('%Y-%m-%d')
+        except:
+            formatted_date = date_str
+            file_date = date_str
+        
+        filename = f"base_{file_date}.txt"
+        caption = f"📂 **База номеров за {formatted_date}**\n\n📊 Всего номеров: {len(data)}"
+    else:
+        data = db.get_all_numbers_raw()
+        today = datetime.now().strftime('%Y-%m-%d')
+        filename = f"base_all_{today}.txt"
+        caption = f"📂 **Полная база номеров**\n\n📊 Всего номеров: {len(data)}"
+    
+    if not data:
+        await callback.answer("📭 Нет данных для экспорта", show_alert=True)
+        return
+    
+    path = filename
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("=" * 80 + "\n")
+        
+        if date_str:
+            f.write(f"БАЗА НОМЕРОВ ЗА {formatted_date}\n")
+        else:
+            f.write("ПОЛНАЯ БАЗА НОМЕРОВ\n")
+        
+        f.write(f"Дата экспорта: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Всего записей: {len(data)}\n")
+        f.write("=" * 80 + "\n\n")
+        
+        f.write(f"{'ID':<6} {'Номер':<15} {'Пользователь':<25} {'Статус':<12} {'Тариф':<15} {'Создан':<20} {'Завершен':<20}\n")
+        f.write("-" * 120 + "\n")
+        
+        for row in data:
+            # row содержит: id, phone, username, status, tariff_name, created_at, finished_at
+            row_id, phone, username, status, tariff_name, created_at, finished_at = row
+            
+            # Обрезаем длинные имена пользователей
+            username_display = username or "—"
+            if len(username_display) > 20:
+                username_display = username_display[:17] + "..."
+            
+            # Форматируем даты
+            created_display = created_at if created_at else "—"
+            finished_display = finished_at if finished_at else "—"
+            
+            f.write(f"{row_id:<6} {phone:<15} @{username_display:<24} {status:<12} {tariff_name:<15} {created_display:<20} {finished_display:<20}\n")
+    
+    try:
+        await callback.message.answer_document(
+            FSInputFile(path), 
+            caption=caption,
+            parse_mode="None"
+        )
+        await callback.answer("✅ Файл отправлен")
     except Exception as e:
         await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
     
     if os.path.exists(path): 
         os.remove(path)
+
+# Модифицируйте существующий обработчик csv, чтобы он использовал общую логику
+@dp.callback_query(F.data == "csv")
+async def csv_handler(callback: CallbackQuery):
+    """Скачать базу номеров (старый вариант - теперь скачивает все)"""
+    await csv_all_handler(callback)
 
 # ============================================
 # ОБРАБОТЧИКИ УПРАВЛЕНИЯ ТАРИФАМИ
