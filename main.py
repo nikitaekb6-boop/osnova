@@ -155,10 +155,10 @@ class Database:
                     chat_type TEXT,
                     registered_by INTEGER,
                     registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_approved INTEGER DEFAULT 0,  # 0=ожидает, 1=одобрен, 2=отклонен
+                    is_approved INTEGER DEFAULT 0,  -- 0=ожидает, 1=одобрен, 2=отклонен
                     assigned_operator_id INTEGER DEFAULT NULL,
                     assigned_topic_id INTEGER DEFAULT NULL,
-                    auto_assign INTEGER DEFAULT 0,  # Автоматическое назначение
+                    auto_assign INTEGER DEFAULT 0,  -- Автоматическое назначение
                     FOREIGN KEY (registered_by) REFERENCES users (user_id),
                     FOREIGN KEY (assigned_operator_id) REFERENCES users (user_id),
                     FOREIGN KEY (assigned_topic_id) REFERENCES chat_topics (id)
