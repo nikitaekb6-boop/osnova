@@ -127,10 +127,12 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     operator_id INTEGER,
                     chat_id INTEGER,
+                    topic_id INTEGER DEFAULT NULL,
                     chat_title TEXT,
                     is_active INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (operator_id) REFERENCES users (user_id)
+                    FOREIGN KEY (operator_id) REFERENCES users (user_id),
+                    UNIQUE(chat_id, topic_id) ON CONFLICT REPLACE
                 )
             """)
             
@@ -260,14 +262,55 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     operator_id INTEGER,
                     chat_id INTEGER,
+                    topic_id INTEGER DEFAULT NULL,
                     chat_title TEXT,
                     is_active INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (operator_id) REFERENCES users (user_id)
+                    FOREIGN KEY (operator_id) REFERENCES users (user_id),
+                    UNIQUE(chat_id, topic_id) ON CONFLICT REPLACE
                 )
             """)
         except:
             pass
+        
+        # Обновляем структуру таблицы operator_chats для поддержки тем
+        try:
+            # Проверяем наличие поля topic_id
+            self.cursor.execute("PRAGMA table_info(operator_chats)")
+            columns = [column[1] for column in self.cursor.fetchall()]
+            
+            if 'topic_id' not in columns:
+                # Создаем временную таблицу с новой структурой
+                self.cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS operator_chats_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        operator_id INTEGER,
+                        chat_id INTEGER,
+                        topic_id INTEGER DEFAULT NULL,
+                        chat_title TEXT,
+                        is_active INTEGER DEFAULT 1,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (operator_id) REFERENCES users (user_id),
+                        UNIQUE(chat_id, topic_id) ON CONFLICT REPLACE
+                    )
+                """)
+                
+                # Копируем данные из старой таблицы
+                self.cursor.execute("""
+                    INSERT INTO operator_chats_new 
+                    (id, operator_id, chat_id, chat_title, is_active, created_at)
+                    SELECT id, operator_id, chat_id, chat_title, is_active, created_at 
+                    FROM operator_chats
+                """)
+                
+                # Удаляем старую таблицу и переименовываем новую
+                self.cursor.execute("DROP TABLE operator_chats")
+                self.cursor.execute("ALTER TABLE operator_chats_new RENAME TO operator_chats")
+                
+                self.connection.commit()
+                print("✅ Таблица operator_chats обновлена с поддержкой тем")
+        except Exception as e:
+            print(f"❌ Ошибка при обновлении таблицы: {e}")
 
     # РЕФЕРАЛЬНАЯ СИСТЕМА
     def get_referral_bonus(self):
@@ -1119,62 +1162,117 @@ class Database:
         """, (user_id,)).fetchone()
 
     # УПРАВЛЕНИЕ ЧАТАМИ ОПЕРАТОРОВ
-    def bind_chat_to_operator(self, operator_id, chat_id, chat_title):
-        """Привязать чат к оператору"""
+    def bind_chat_to_operator(self, operator_id, chat_id, chat_title, topic_id=None):
+        """Привязать чат к оператору с возможностью привязки к теме"""
         with self.connection:
-            # Проверяем, привязан ли уже этот чат
-            existing = self.cursor.execute(
-                "SELECT id FROM operator_chats WHERE chat_id = ? AND is_active = 1",
-                (chat_id,)
-            ).fetchone()
-            
-            if existing:
-                return False, "❌ Этот чат уже привязан к другому оператору!"
-            
             # Проверяем, является ли пользователь оператором
             if not self.is_admin(operator_id):
                 return False, "❌ Пользователь не является оператором!"
             
+            # Если указан topic_id, проверяем уникальность связки чат+тема
+            if topic_id:
+                existing = self.cursor.execute(
+                    "SELECT id FROM operator_chats WHERE chat_id = ? AND topic_id = ? AND is_active = 1",
+                    (chat_id, topic_id)
+                ).fetchone()
+                
+                if existing:
+                    return False, f"❌ Этот чат уже привязан к теме {topic_id}!"
+            else:
+                # Для обычных чатов без темы проверяем уникальность чата
+                existing = self.cursor.execute(
+                    "SELECT id FROM operator_chats WHERE chat_id = ? AND topic_id IS NULL AND is_active = 1",
+                    (chat_id,)
+                ).fetchone()
+                
+                if existing:
+                    return False, "❌ Этот чат уже привязан к другому оператору!"
+            
             # Привязываем чат
             self.cursor.execute(
-                "INSERT INTO operator_chats (operator_id, chat_id, chat_title) VALUES (?, ?, ?)",
-                (operator_id, chat_id, chat_title)
+                "INSERT INTO operator_chats (operator_id, chat_id, topic_id, chat_title) VALUES (?, ?, ?, ?)",
+                (operator_id, chat_id, topic_id, chat_title)
             )
+            
             return True, "✅ Чат успешно привязан к оператору!"
 
-    def unbind_chat_from_operator(self, chat_id):
+    def unbind_chat_from_operator(self, chat_id, topic_id=None):
         """Отвязать чат от оператора"""
         with self.connection:
-            # Проверяем, привязан ли чат
-            existing = self.cursor.execute(
-                "SELECT id, operator_id FROM operator_chats WHERE chat_id = ? AND is_active = 1",
-                (chat_id,)
-            ).fetchone()
-            
-            if not existing:
-                return False, "❌ Этот чат не привязан ни к одному оператору!"
-            
-            # Отвязываем чат
-            self.cursor.execute(
-                "UPDATE operator_chats SET is_active = 0 WHERE chat_id = ?",
-                (chat_id,)
-            )
-            return True, "✅ Чат успешно отвязан от оператора!"
+            if topic_id:
+                # Отвязываем конкретную тему
+                existing = self.cursor.execute(
+                    "SELECT id, operator_id FROM operator_chats WHERE chat_id = ? AND topic_id = ? AND is_active = 1",
+                    (chat_id, topic_id)
+                ).fetchone()
+                
+                if not existing:
+                    return False, f"❌ Тема {topic_id} не привязана ни к одному оператору!"
+                
+                self.cursor.execute(
+                    "UPDATE operator_chats SET is_active = 0 WHERE chat_id = ? AND topic_id = ?",
+                    (chat_id, topic_id)
+                )
+                return True, f"✅ Тема {topic_id} успешно отвязана!"
+            else:
+                # Отвязываем весь чат (все темы и сам чат)
+                existing = self.cursor.execute(
+                    "SELECT id, operator_id FROM operator_chats WHERE chat_id = ? AND is_active = 1",
+                    (chat_id,)
+                ).fetchall()
+                
+                if not existing:
+                    return False, "❌ Этот чат не привязан ни к одному оператору!"
+                
+                self.cursor.execute(
+                    "UPDATE operator_chats SET is_active = 0 WHERE chat_id = ?",
+                    (chat_id,)
+                )
+                return True, f"✅ Чат и все его темы ({len(existing)} шт.) отвязаны!"
 
-    def get_operator_by_chat(self, chat_id):
-        """Получить оператора, к которому привязан чат"""
-        res = self.cursor.execute(
-            "SELECT operator_id FROM operator_chats WHERE chat_id = ? AND is_active = 1",
-            (chat_id,)
-        ).fetchone()
+    def get_operator_by_chat(self, chat_id, topic_id=None):
+        """Получить оператора, к которому привязан чат (с учетом темы)"""
+        if topic_id:
+            res = self.cursor.execute(
+                "SELECT operator_id FROM operator_chats WHERE chat_id = ? AND topic_id = ? AND is_active = 1",
+                (chat_id, topic_id)
+            ).fetchone()
+        else:
+            # Если тема не указана, ищем привязку без темы или для текущей темы
+            res = self.cursor.execute(
+                "SELECT operator_id FROM operator_chats WHERE chat_id = ? AND (topic_id = ? OR topic_id IS NULL) AND is_active = 1 ORDER BY topic_id DESC LIMIT 1",
+                (chat_id, topic_id)
+            ).fetchone()
+        
         return res[0] if res else None
 
-    def get_operator_chats(self, operator_id):
+    def get_operator_chats(self, operator_id, include_topics=True):
         """Получить все чаты оператора"""
+        if include_topics:
+            return self.cursor.execute(
+                "SELECT id, chat_id, topic_id, chat_title, created_at FROM operator_chats WHERE operator_id = ? AND is_active = 1 ORDER BY topic_id, created_at DESC",
+                (operator_id,)
+            ).fetchall()
+        else:
+            return self.cursor.execute(
+                "SELECT id, chat_id, chat_title, created_at FROM operator_chats WHERE operator_id = ? AND topic_id IS NULL AND is_active = 1 ORDER BY created_at DESC",
+                (operator_id,)
+            ).fetchall()
+    
+    def get_chat_topics(self, chat_id):
+        """Получить все привязанные темы в чате"""
         return self.cursor.execute(
-            "SELECT id, chat_id, chat_title, created_at FROM operator_chats WHERE operator_id = ? AND is_active = 1 ORDER BY created_at DESC",
-            (operator_id,)
+            "SELECT topic_id, operator_id FROM operator_chats WHERE chat_id = ? AND topic_id IS NOT NULL AND is_active = 1 ORDER BY topic_id",
+            (chat_id,)
         ).fetchall()
+    
+    def is_topic_bound(self, chat_id, topic_id):
+        """Проверить, привязана ли тема к оператору"""
+        res = self.cursor.execute(
+            "SELECT operator_id FROM operator_chats WHERE chat_id = ? AND topic_id = ? AND is_active = 1",
+            (chat_id, topic_id)
+        ).fetchone()
+        return bool(res)
 
     def get_all_bound_chats(self):
         """Получить все привязанные чаты"""
@@ -1235,6 +1333,7 @@ class Form(StatesGroup):
     waiting_for_hidden_bonus_minutes = State()
     # Состояния для привязки/отвязки чатов
     waiting_for_chat_to_bind = State()
+    waiting_for_topic_to_bind = State()  # Новое: выбор темы
     waiting_for_chat_to_unbind = State()
     waiting_for_operator_for_chat = State()
 
@@ -2398,10 +2497,12 @@ async def number_cmd(message: types.Message):
         await message.answer("❌ У вас нет прав доступа к этой команде.")
         return
     
-    # Проверяем привязку чата для операторов (кроме супер-админов)
+    # Проверяем привязку чата/темы для операторов
     if user_id not in ADMIN_IDS:
         chat_id = message.chat.id
-        operator_for_chat = db.get_operator_by_chat(chat_id)
+        message_thread_id = getattr(message, 'message_thread_id', None)
+        
+        operator_for_chat = db.get_operator_by_chat(chat_id, message_thread_id)
         
         if operator_for_chat != user_id:
             # Получаем информацию о чате
@@ -2411,15 +2512,21 @@ async def number_cmd(message: types.Message):
             except:
                 chat_title = "этот чат"
             
-            await message.answer(
-                f"🚫 **Доступ запрещен!**\n\n"
-                f"Чат **{chat_title}** не привязан к вам.\n\n"
+            error_msg = f"🚫 **Доступ запрещен!**\n\n"
+            
+            if message_thread_id:
+                error_msg += f"Тема #{message_thread_id} в чате **{chat_title}** не привязана к вам.\n\n"
+            else:
+                error_msg += f"Чат **{chat_title}** не привязан к вам.\n\n"
+            
+            error_msg += (
                 f"💡 **Что делать?**\n"
-                f"1. Перейдите в чат, который привязан к вам\n"
+                f"1. Перейдите в чат/тему, которая привязана к вам\n"
                 f"2. Используйте команду /mychats чтобы посмотреть свои чаты\n"
-                f"3. Обратитесь к администратору для привязки нового чата",
-                parse_mode="None"
+                f"3. Обратитесь к администратору для привязки\n"
             )
+            
+            await message.answer(error_msg, parse_mode="Markdown")
             return
 
     number = db.get_next_number_from_queue()
@@ -4948,7 +5055,7 @@ async def admin_bind_chat_handler(callback: CallbackQuery, state: FSMContext):
     
     await callback.message.edit_text(
         "➕ **Привязка чата к оператору**\n\n"
-        "Шаг 1 из 2\n\n"
+        "Шаг 1 из 3\n\n"
         "Отправьте мне ID чата, который нужно привязать:\n\n"
         "💡 **Как получить ID чата?**\n"
         "1. Добавьте меня в нужный чат\n"
@@ -4958,7 +5065,7 @@ async def admin_bind_chat_handler(callback: CallbackQuery, state: FSMContext):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_chat_management")]
         ]),
-        parse_mode="None"
+        parse_mode="Markdown"
     )
 
 # Обработка ID чата для привязки
@@ -4976,17 +5083,41 @@ async def process_chat_to_bind(message: types.Message, state: FSMContext):
     
     chat_id = int(message.text)
     
-    # Проверяем, привязан ли уже этот чат
-    existing_operator = db.get_operator_by_chat(chat_id)
-    if existing_operator:
-        await message.answer(f"❌ Этот чат уже привязан к оператору (ID: {existing_operator})!")
-        await state.clear()
+    try:
+        # Получаем информацию о чате
+        chat = await bot.get_chat(chat_id)
+        chat_title = chat.title or "Без названия"
+    except Exception as e:
+        await message.answer(f"❌ Не удалось получить информацию о чате: {e}")
         return
     
-    # Сохраняем ID чата и переходим к выбору оператора
-    await state.update_data(chat_id_to_bind=chat_id)
-    await state.set_state(Form.waiting_for_operator_for_chat)
+    # Сохраняем данные
+    await state.update_data(chat_id_to_bind=chat_id, chat_title=chat_title)
     
+    # Проверяем, является ли это форумом
+    if chat.type == 'supergroup' and chat.is_forum:
+        # Если это форум, предлагаем привязать тему
+        buttons = [
+            [InlineKeyboardButton(text="📌 Привязать весь чат", callback_data="bind_whole_chat")],
+            [InlineKeyboardButton(text="📝 Привязать тему", callback_data="bind_specific_topic")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_chat_management")]
+        ]
+        
+        await state.set_state(Form.waiting_for_topic_to_bind)
+        await message.answer(
+            f"📋 **Чат найден:** {chat_title}\n\n"
+            f"ℹ️ Этот чат является **форумом** с темами.\n\n"
+            "Выберите, что привязать:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="Markdown"
+        )
+    else:
+        # Обычный чат, сразу переходим к выбору оператора
+        await state.update_data(bind_type='chat')
+        await choose_operator_step(message, state)
+
+async def choose_operator_step(message: types.Message, state: FSMContext):
+    """Шаг выбора оператора"""
     # Получаем список операторов
     admins = db.get_admins_list()
     
@@ -4995,7 +5126,17 @@ async def process_chat_to_bind(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    text = "👤 **Выбор оператора**\n\nШаг 2 из 2\n\nВыберите оператора для привязки чата:"
+    text = "👤 **Выбор оператора**\n\n"
+    
+    data = await state.get_data()
+    chat_title = data.get('chat_title', 'чат')
+    bind_type = data.get('bind_type', 'чат')
+    topic_id = data.get('topic_id')
+    
+    if bind_type == 'topic':
+        text += f"Шаг 3 из 3\n\nПривязка темы #{topic_id} в чате {chat_title}\n\nВыберите оператора:"
+    else:
+        text += f"Шаг 2 из 2\n\nПривязка чата {chat_title}\n\nВыберите оператора:"
     
     buttons = []
     for admin in admins:
@@ -5010,7 +5151,88 @@ async def process_chat_to_bind(message: types.Message, state: FSMContext):
     
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_chat_management")])
     
-    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+    await state.set_state(Form.waiting_for_operator_for_chat)
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+
+# Обработчик выбора типа привязки
+@dp.callback_query(Form.waiting_for_topic_to_bind)
+async def handle_bind_type(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора типа привязки"""
+    if callback.data == "bind_whole_chat":
+        await state.update_data(bind_type='chat')
+        await choose_operator_step(callback.message, state)
+        
+    elif callback.data == "bind_specific_topic":
+        data = await state.get_data()
+        chat_id = data.get('chat_id_to_bind')
+        
+        try:
+            # Пытаемся получить список тем
+            forum_topics = await bot.get_forum_topics(chat_id)
+            
+            if not forum_topics.topics:
+                await callback.answer("❌ В этом форуме нет тем!", show_alert=True)
+                await state.update_data(bind_type='chat')
+                await choose_operator_step(callback.message, state)
+                return
+            
+            # Создаем кнопки для выбора темы
+            buttons = []
+            for topic in forum_topics.topics:
+                if not topic.is_hidden and not topic.is_closed:
+                    topic_name = topic.name[:20] + "..." if len(topic.name) > 20 else topic.name
+                    buttons.append([
+                        InlineKeyboardButton(
+                            text=f"📝 {topic_name} (ID: {topic.message_thread_id})",
+                            callback_data=f"bind_topic_{topic.message_thread_id}"
+                        )
+                    ])
+            
+            buttons.append([InlineKeyboardButton(text="🔙 Назад к выбору", callback_data="back_to_bind_type")])
+            
+            await callback.message.edit_text(
+                "📌 **Выбор темы для привязки**\n\n"
+                "Шаг 2 из 3\n\n"
+                "Выберите тему из списка ниже:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+                parse_mode="Markdown"
+            )
+            
+        except Exception as e:
+            await callback.answer(f"❌ Ошибка получения тем: {e}", show_alert=True)
+            await state.update_data(bind_type='chat')
+            await choose_operator_step(callback.message, state)
+            
+    elif callback.data == "back_to_bind_type":
+        # Возвращаемся к выбору типа привязки
+        data = await state.get_data()
+        chat_title = data.get('chat_title', 'чат')
+        
+        buttons = [
+            [InlineKeyboardButton(text="📌 Привязать весь чат", callback_data="bind_whole_chat")],
+            [InlineKeyboardButton(text="📝 Привязать тему", callback_data="bind_specific_topic")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_chat_management")]
+        ]
+        
+        await callback.message.edit_text(
+            f"📋 **Чат:** {chat_title}\n\n"
+            f"ℹ️ Этот чат является **форумом** с темами.\n\n"
+            "Выберите, что привязать:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="Markdown"
+        )
+
+# Обработчик выбора конкретной темы
+@dp.callback_query(F.data.startswith("bind_topic_"))
+async def handle_topic_selection(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора темы"""
+    topic_id = int(callback.data.split("_")[2])
+    
+    # Сохраняем данные о теме
+    await state.update_data(bind_type='topic', topic_id=topic_id)
+    
+    # Переходим к выбору оператора
+    await choose_operator_step(callback.message, state)
 
 # Обработка выбора оператора для привязки
 @dp.callback_query(F.data.startswith("bind_operator_"))
@@ -5025,49 +5247,69 @@ async def bind_operator_handler(callback: CallbackQuery, state: FSMContext):
     # Получаем данные из состояния
     data = await state.get_data()
     chat_id = data.get('chat_id_to_bind')
+    chat_title = data.get('chat_title', 'Без названия')
+    bind_type = data.get('bind_type', 'chat')
+    topic_id = data.get('topic_id')
     
     if not chat_id:
         await callback.answer("❌ Ошибка: не найден ID чата", show_alert=True)
         await state.clear()
         return
     
-    try:
-        # Получаем информацию о чате
-        chat = await bot.get_chat(chat_id)
-        chat_title = chat.title or "Без названия"
-    except Exception as e:
-        chat_title = "Неизвестный чат"
-    
-    # Привязываем чат
-    success, message_text = db.bind_chat_to_operator(operator_id, chat_id, chat_title)
+    # Привязываем чат или тему
+    success, message_text = db.bind_chat_to_operator(
+        operator_id=operator_id,
+        chat_id=chat_id,
+        chat_title=chat_title,
+        topic_id=topic_id if bind_type == 'topic' else None
+    )
     
     if success:
         # Уведомляем оператора
         try:
-            await bot.send_message(
-                operator_id,
-                f"💬 **Вам привязан новый чат!**\n\n"
-                f"📝 **Название:** {chat_title}\n"
-                f"🆔 **ID чата:** `{chat_id}`\n\n"
-                f"Теперь этот чат закреплен за вами.",
-                parse_mode="None"
-            )
+            if bind_type == 'topic':
+                await bot.send_message(
+                    operator_id,
+                    f"💬 **Вам привязана новая тема!**\n\n"
+                    f"📝 **Чат:** {chat_title}\n"
+                    f"📌 **Тема:** #{topic_id}\n"
+                    f"🆔 **ID чата:** `{chat_id}`\n\n"
+                    f"Теперь эта тема закреплена за вами.",
+                    parse_mode="Markdown"
+                )
+            else:
+                await bot.send_message(
+                    operator_id,
+                    f"💬 **Вам привязан новый чат!**\n\n"
+                    f"📝 **Название:** {chat_title}\n"
+                    f"🆔 **ID чата:** `{chat_id}`\n\n"
+                    f"Теперь этот чат закреплен за вами.",
+                    parse_mode="Markdown"
+                )
         except:
             pass
         
-        await callback.message.edit_text(
-            f"✅ **Чат успешно привязан!**\n\n"
-            f"📝 **Чат:** {chat_title}\n"
-            f"🆔 **ID чата:** `{chat_id}`\n"
-            f"👤 **Оператор:** ID {operator_id}\n\n"
-            f"Оператор уведомлен о привязке.",
-            parse_mode="None"
-        )
+        if bind_type == 'topic':
+            result_text = (
+                f"✅ **Тема успешно привязана!**\n\n"
+                f"📝 **Чат:** {chat_title}\n"
+                f"📌 **Тема:** #{topic_id}\n"
+                f"🆔 **ID чата:** `{chat_id}`\n"
+                f"👤 **Оператор:** ID {operator_id}\n\n"
+                f"Оператор уведомлен о привязке."
+            )
+        else:
+            result_text = (
+                f"✅ **Чат успешно привязан!**\n\n"
+                f"📝 **Чат:** {chat_title}\n"
+                f"🆔 **ID чата:** `{chat_id}`\n"
+                f"👤 **Оператор:** ID {operator_id}\n\n"
+                f"Оператор уведомлен о привязке."
+            )
+        
+        await callback.message.edit_text(result_text, parse_mode="Markdown")
     else:
-        await callback.message.edit_text(
-            f"❌ **Ошибка привязки!**\n\n{message_text}",
-            parse_mode="None"
-        )
+        await callback.message.edit_text(f"❌ **Ошибка привязки!**\n\n{message_text}", parse_mode="Markdown")
     
     await state.clear()
 
@@ -5083,16 +5325,20 @@ async def admin_unbind_chat_handler(callback: CallbackQuery, state: FSMContext):
     
     await callback.message.edit_text(
         "➖ **Отвязка чата от оператора**\n\n"
-        "Отправьте мне ID чата, который нужно отвязать:\n\n"
-        "💡 **Как найти ID чата?**\n"
-        "1. Зайдите в меню 'Список чатов'\n"
-        "2. Посмотрите ID нужного чата\n"
-        "3. Отправьте его сюда\n\n"
-        "Или просто отправьте сюда ID чата (число):",
+        "Отправьте мне информацию в формате:\n"
+        "`ID_чата` - для отвязки всего чата\n"
+        "`ID_чата #ID_темы` - для отвязки конкретной темы\n\n"
+        "Примеры:\n"
+        "`123456789` - отвязать весь чат\n"
+        "`123456789 #5` - отвязать тему 5\n\n"
+        "💡 **Как найти ID чата и темы?**\n"
+        "1. Используйте команду /chatid в нужном чате\n"
+        "2. Посмотрите ID чата и темы\n"
+        "3. Отправьте их сюда",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_chat_management")]
         ]),
-        parse_mode="None"
+        parse_mode="Markdown"
     )
 
 # Обработка отвязки чата
@@ -5104,45 +5350,87 @@ async def process_chat_to_unbind(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    if not message.text.isdigit():
-        await message.answer("❌ ID чата должен быть числом!")
-        return
+    text = message.text.strip()
     
-    chat_id = int(message.text)
+    # Парсим ввод
+    if '#' in text:
+        parts = text.split('#')
+        if len(parts) == 2:
+            chat_id_part = parts[0].strip()
+            topic_id_part = parts[1].strip()
+            
+            if not chat_id_part.isdigit():
+                await message.answer("❌ ID чата должен быть числом!")
+                return
+            
+            if not topic_id_part.isdigit():
+                await message.answer("❌ ID темы должен быть числом после #!")
+                return
+            
+            chat_id = int(chat_id_part)
+            topic_id = int(topic_id_part)
+        else:
+            await message.answer("❌ Неправильный формат! Используйте: `ID_чата #ID_темы`", parse_mode="Markdown")
+            return
+    else:
+        if not text.isdigit():
+            await message.answer("❌ ID чата должен быть числом!")
+            return
+        chat_id = int(text)
+        topic_id = None
     
-    # Отвязываем чат
-    success, message_text = db.unbind_chat_from_operator(chat_id)
+    # Отвязываем чат или тему
+    success, message_text = db.unbind_chat_from_operator(chat_id, topic_id)
     
     if success:
-        # Получаем информацию о чате для уведомления оператора
-        chat_info = db.cursor.execute(
-            "SELECT operator_id, chat_title FROM operator_chats WHERE chat_id = ?",
-            (chat_id,)
-        ).fetchone()
+        # Получаем информацию для уведомления оператора
+        if topic_id:
+            # Отвязка темы
+            chat_info = db.cursor.execute(
+                "SELECT operator_id, chat_title FROM operator_chats WHERE chat_id = ? AND topic_id = ?",
+                (chat_id, topic_id)
+            ).fetchone()
+        else:
+            # Отвязка всего чата
+            chat_info = db.cursor.execute(
+                "SELECT operator_id, chat_title FROM operator_chats WHERE chat_id = ? AND topic_id IS NULL",
+                (chat_id,)
+            ).fetchone()
         
         if chat_info:
             operator_id, chat_title = chat_info
             # Уведомляем оператора
             try:
-                await bot.send_message(
-                    operator_id,
-                    f"💬 **Чат отвязан от вас!**\n\n"
-                    f"📝 **Чат:** {chat_title or 'Без названия'}\n"
-                    f"🆔 **ID чата:** `{chat_id}`\n\n"
-                    f"Этот чат больше не закреплен за вами.",
-                    parse_mode="None"
-                )
+                if topic_id:
+                    await bot.send_message(
+                        operator_id,
+                        f"💬 **Тема отвязана от вас!**\n\n"
+                        f"📝 **Чат:** {chat_title or 'Без названия'}\n"
+                        f"📌 **Тема:** #{topic_id}\n"
+                        f"🆔 **ID чата:** `{chat_id}`\n\n"
+                        f"Эта тема больше не закреплена за вами.",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await bot.send_message(
+                        operator_id,
+                        f"💬 **Чат отвязан от вас!**\n\n"
+                        f"📝 **Чат:** {chat_title or 'Без названия'}\n"
+                        f"🆔 **ID чата:** `{chat_id}`\n\n"
+                        f"Этот чат больше не закреплен за вами.",
+                        parse_mode="Markdown"
+                    )
             except:
                 pass
         
-        await message.answer(
-            f"✅ **Чат успешно отвязан!**\n\n"
-            f"🆔 **ID чата:** `{chat_id}`\n\n"
-            f"Чат больше не привязан ни к одному оператору.",
-            parse_mode="None"
-        )
+        if topic_id:
+            result_text = f"✅ **Тема #{topic_id} успешно отвязана!**\n\n🆔 **ID чата:** `{chat_id}`"
+        else:
+            result_text = f"✅ **Чат успешно отвязан!**\n\n🆔 **ID чата:** `{chat_id}`"
+        
+        await message.answer(result_text, parse_mode="Markdown")
     else:
-        await message.answer(f"❌ {message_text}", parse_mode="None")
+        await message.answer(f"❌ {message_text}", parse_mode="Markdown")
     
     await state.clear()
 
@@ -5247,28 +5535,60 @@ async def chatid_cmd(message: types.Message):
     """Получить ID текущего чата"""
     chat_id = message.chat.id
     chat_title = message.chat.title or "Личные сообщения"
+    message_thread_id = getattr(message, 'message_thread_id', None)
     
     text = (
         f"💬 **Информация о чате**\n\n"
         f"📝 **Название:** {chat_title}\n"
         f"🆔 **ID чата:** `{chat_id}`\n"
-        f"👥 **Тип чата:** {'Группа/Канал' if message.chat.type != 'private' else 'Личные сообщения'}\n\n"
+        f"👥 **Тип чата:** {message.chat.type}\n"
     )
     
-    # Проверяем, привязан ли чат к оператору
-    operator_id = db.get_operator_by_chat(chat_id)
-    if operator_id:
-        operator_info = db.cursor.execute(
-            "SELECT username FROM users WHERE user_id = ?",
-            (operator_id,)
-        ).fetchone()
-        operator_name = operator_info[0] if operator_info else f"ID{operator_id}"
-        
-        text += f"🔗 **Привязан к оператору:** @{operator_name} (ID: `{operator_id}`)"
-    else:
-        text += f"🔓 **Статус:** Не привязан к оператору"
+    if message_thread_id:
+        text += f"📌 **ID темы:** `{message_thread_id}`\n"
     
-    await message.answer(text, parse_mode="None")
+    text += "\n"
+    
+    # Проверяем привязки
+    if message_thread_id:
+        # Проверяем привязку конкретной темы
+        operator_id = db.get_operator_by_chat(chat_id, message_thread_id)
+        if operator_id:
+            operator_info = db.cursor.execute(
+                "SELECT username FROM users WHERE user_id = ?",
+                (operator_id,)
+            ).fetchone()
+            operator_name = operator_info[0] if operator_info else f"ID{operator_id}"
+            text += f"🔗 **Тема привязана к оператору:** @{operator_name} (ID: `{operator_id}`)\n"
+        else:
+            text += f"🔓 **Тема не привязана**\n"
+    else:
+        # Проверяем общие привязки чата
+        operator_id = db.get_operator_by_chat(chat_id)
+        if operator_id:
+            operator_info = db.cursor.execute(
+                "SELECT username FROM users WHERE user_id = ?",
+                (operator_id,)
+            ).fetchone()
+            operator_name = operator_info[0] if operator_info else f"ID{operator_id}"
+            text += f"🔗 **Чат привязан к оператору:** @{operator_name} (ID: `{operator_id}`)\n"
+        else:
+            text += f"🔓 **Чат не привязан**\n"
+    
+    # Показываем все привязанные темы если это форум
+    if message.chat.type == 'supergroup' and getattr(message.chat, 'is_forum', False):
+        topics = db.get_chat_topics(chat_id)
+        if topics:
+            text += "\n📋 **Привязанные темы в этом чате:**\n"
+            for topic_id, topic_operator_id in topics:
+                operator_info = db.cursor.execute(
+                    "SELECT username FROM users WHERE user_id = ?",
+                    (topic_operator_id,)
+                ).fetchone()
+                operator_name = operator_info[0] if operator_info else f"ID{topic_operator_id}"
+                text += f"  • Тема #{topic_id} → @{operator_name}\n"
+    
+    await message.answer(text, parse_mode="Markdown")
 
 # Команда для операторов чтобы посмотреть свои чаты
 @dp.message(Command("mychats"))
@@ -5281,23 +5601,44 @@ async def mychats_cmd(message: types.Message):
         await message.answer("❌ У вас нет прав доступа к этой команде.")
         return
     
-    # Получаем чаты оператора
-    chats = db.get_operator_chats(user_id)
+    # Получаем все чаты оператора (включая темы)
+    chats = db.get_operator_chats(user_id, include_topics=True)
     
     if not chats:
-        text = "📋 **У вас нет привязанных чатов**\n\nОбратитесь к администратору для привязки чатов."
+        text = "📋 **У вас нет привязанных чатов или тем**\n\nОбратитесь к администратору для привязки."
     else:
-        text = f"📋 **Ваши привязанные чаты** ({len(chats)} шт.)\n\n"
+        # Группируем по чатам
+        chats_by_chat_id = {}
+        for chat in chats:
+            chat_id, chat_id_num, topic_id, chat_title, created_at = chat
+            if chat_id not in chats_by_chat_id:
+                chats_by_chat_id[chat_id] = {
+                    'title': chat_title,
+                    'topics': [],
+                    'created_at': created_at
+                }
+            if topic_id:
+                chats_by_chat_id[chat_id]['topics'].append(topic_id)
         
-        for i, chat in enumerate(chats, 1):
-            chat_id, chat_id_num, chat_title, created_at = chat
-            created_date = created_at.split()[0] if created_at else "—"
+        text = f"📋 **Ваши привязанные чаты и темы** ({len(chats)} шт.)\n\n"
+        
+        for i, (chat_id, chat_info) in enumerate(chats_by_chat_id.items(), 1):
+            chat_title = chat_info['title'] or 'Без названия'
+            topics = chat_info['topics']
+            created_date = chat_info['created_at'].split()[0] if chat_info['created_at'] else "—"
             
-            text += f"{i}. **{chat_title or 'Без названия'}**\n"
-            text += f"   🆔 ID: `{chat_id_num}`\n"
-            text += f"   📅 Привязан: {created_date}\n\n"
+            text += f"{i}. **{chat_title}**\n"
+            text += f"   🆔 ID чата: `{chat_id}`\n"
+            text += f"   📅 Привязка: {created_date}\n"
+            
+            if topics:
+                text += f"   📌 Привязанные темы: {', '.join([f'#{tid}' for tid in topics])}\n"
+            else:
+                text += f"   📌 Привязан весь чат (без темы)\n"
+            
+            text += "\n"
     
-    await message.answer(text, parse_mode="None")
+    await message.answer(text, parse_mode="Markdown")
 
 # ============================================
 # ЗАПУСК БОТА
