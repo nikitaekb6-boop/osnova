@@ -136,6 +136,50 @@ class Database:
                 )
             """)
             
+            # Таблица тем чатов
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS chat_topics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Таблица автоматической регистрации чатов
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS chat_registrations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER UNIQUE,
+                    chat_title TEXT,
+                    chat_type TEXT,
+                    registered_by INTEGER,
+                    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_approved INTEGER DEFAULT 0,  # 0=ожидает, 1=одобрен, 2=отклонен
+                    assigned_operator_id INTEGER DEFAULT NULL,
+                    assigned_topic_id INTEGER DEFAULT NULL,
+                    auto_assign INTEGER DEFAULT 0,  # Автоматическое назначение
+                    FOREIGN KEY (registered_by) REFERENCES users (user_id),
+                    FOREIGN KEY (assigned_operator_id) REFERENCES users (user_id),
+                    FOREIGN KEY (assigned_topic_id) REFERENCES chat_topics (id)
+                )
+            """)
+            
+            # Таблица настроек автоматического распределения
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS auto_assign_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    topic_id INTEGER,
+                    operator_id INTEGER,
+                    priority INTEGER DEFAULT 1,
+                    max_chats INTEGER DEFAULT 3,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (topic_id) REFERENCES chat_topics (id),
+                    FOREIGN KEY (operator_id) REFERENCES users (user_id)
+                )
+            """)
+            
             # Инициализация настроек
             settings = [
                 ('priority_price', '0.5'),
@@ -147,7 +191,10 @@ class Database:
                 ('min_withdrawal', '1.0'),
                 ('payment_methods', 'CryptoBot'),
                 ('referral_bonus', '0.5'),  # Бонус за реферала ($)
-                ('referral_enabled', '1')   # Включена ли реферальная система
+                ('referral_enabled', '1'),   # Включена ли реферальная система
+                ('auto_assign_enabled', '1'),  # Включено ли автораспределение
+                ('auto_assign_notify_admins', '1'),  # Уведомлять админов
+                ('new_chat_message', '👋 Бот добавлен в чат! Ожидайте назначения оператора...')
             ]
             
             for key, value in settings:
@@ -311,6 +358,59 @@ class Database:
                 print("✅ Таблица operator_chats обновлена с поддержкой тем")
         except Exception as e:
             print(f"❌ Ошибка при обновлении таблицы: {e}")
+        
+        # Таблица тем чатов
+        try:
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS chat_topics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        except:
+            pass
+        
+        # Таблица регистрации чатов
+        try:
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS chat_registrations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER UNIQUE,
+                    chat_title TEXT,
+                    chat_type TEXT,
+                    registered_by INTEGER,
+                    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_approved INTEGER DEFAULT 0,
+                    assigned_operator_id INTEGER DEFAULT NULL,
+                    assigned_topic_id INTEGER DEFAULT NULL,
+                    auto_assign INTEGER DEFAULT 0,
+                    FOREIGN KEY (registered_by) REFERENCES users (user_id),
+                    FOREIGN KEY (assigned_operator_id) REFERENCES users (user_id),
+                    FOREIGN KEY (assigned_topic_id) REFERENCES chat_topics (id)
+                )
+            """)
+        except:
+            pass
+        
+        # Таблица правил автоназначения
+        try:
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS auto_assign_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    topic_id INTEGER,
+                    operator_id INTEGER,
+                    priority INTEGER DEFAULT 1,
+                    max_chats INTEGER DEFAULT 3,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (topic_id) REFERENCES chat_topics (id),
+                    FOREIGN KEY (operator_id) REFERENCES users (user_id)
+                )
+            """)
+        except:
+            pass
 
     # РЕФЕРАЛЬНАЯ СИСТЕМА
     def get_referral_bonus(self):
@@ -1285,6 +1385,263 @@ class Database:
             ORDER BY oc.created_at DESC
         """).fetchall()
 
+    # МЕТОДЫ ДЛЯ РАБОТЫ С ТЕМАМИ
+    def get_all_topics(self):
+        """Получить все темы чатов"""
+        return self.cursor.execute("""
+            SELECT id, name, description, created_at 
+            FROM chat_topics 
+            ORDER BY name ASC
+        """).fetchall()
+
+    def get_topic_by_id(self, topic_id):
+        """Получить тему по ID"""
+        return self.cursor.execute("""
+            SELECT id, name, description, created_at 
+            FROM chat_topics 
+            WHERE id = ?
+        """, (topic_id,)).fetchone()
+
+    # МЕТОДЫ ДЛЯ АВТОМАТИЧЕСКОЙ РЕГИСТРАЦИИ И НАЗНАЧЕНИЯ ЧАТОВ
+    def register_chat(self, chat_id, chat_title, chat_type, registered_by):
+        """Зарегистрировать новый чат (автоматически при добавлении бота)"""
+        with self.connection:
+            # Проверяем, не зарегистрирован ли уже чат
+            existing = self.cursor.execute(
+                "SELECT id, is_approved FROM chat_registrations WHERE chat_id = ?",
+                (chat_id,)
+            ).fetchone()
+            
+            if existing:
+                return False, "Чат уже зарегистрирован"
+            
+            # Регистрируем чат
+            self.cursor.execute("""
+                INSERT INTO chat_registrations 
+                (chat_id, chat_title, chat_type, registered_by, is_approved) 
+                VALUES (?, ?, ?, ?, 0)
+            """, (chat_id, chat_title, chat_type, registered_by))
+            
+            # Проверяем автоназначение
+            auto_enabled = self.get_setting('auto_assign_enabled', '1')
+            if auto_enabled == '1':
+                # Пытаемся автоматически назначить
+                success, message = self.auto_assign_chat(chat_id)
+                if success:
+                    return True, "auto_assigned"
+            
+            return True, "registered"
+
+    def auto_assign_chat(self, chat_id):
+        """Автоматически назначить оператора и тему чату"""
+        with self.connection:
+            # Получаем правила автоназначения
+            rules = self.cursor.execute("""
+                SELECT ar.id, ar.topic_id, ar.operator_id, ar.priority, ar.max_chats,
+                       ct.name as topic_name, u.username as operator_name
+                FROM auto_assign_rules ar
+                LEFT JOIN chat_topics ct ON ar.topic_id = ct.id
+                LEFT JOIN users u ON ar.operator_id = u.user_id
+                WHERE ar.is_active = 1
+                ORDER BY ar.priority ASC
+            """).fetchall()
+            
+            if not rules:
+                return False, "Нет правил автоназначения"
+            
+            # Проверяем нагрузку операторов
+            available_rules = []
+            for rule in rules:
+                rule_id, topic_id, operator_id, priority, max_chats, topic_name, operator_name = rule
+                
+                # Считаем сколько чатов уже у оператора
+                current_chats = self.cursor.execute("""
+                    SELECT COUNT(*) FROM operator_chats 
+                    WHERE operator_id = ? AND is_active = 1
+                """, (operator_id,)).fetchone()[0]
+                
+                if current_chats < max_chats:
+                    available_rules.append((rule_id, topic_id, operator_id, topic_name, operator_name, priority))
+            
+            if not available_rules:
+                return False, "Нет доступных операторов"
+            
+            # Выбираем правило с наивысшим приоритетом (меньшее число = выше приоритет)
+            best_rule = min(available_rules, key=lambda x: x[5])
+            rule_id, topic_id, operator_id, topic_name, operator_name, priority = best_rule
+            
+            # Назначаем чат
+            chat_info = self.cursor.execute(
+                "SELECT chat_title FROM chat_registrations WHERE chat_id = ?",
+                (chat_id,)
+            ).fetchone()
+            
+            if chat_info:
+                chat_title = chat_info[0]
+                
+                # Привязываем чат
+                success, message = self.bind_chat_to_operator(
+                    operator_id, chat_id, chat_title, topic_id
+                )
+                
+                if success:
+                    # Обновляем регистрацию
+                    self.cursor.execute("""
+                        UPDATE chat_registrations 
+                        SET is_approved = 1, assigned_operator_id = ?, assigned_topic_id = ?, auto_assign = 1
+                        WHERE chat_id = ?
+                    """, (operator_id, topic_id, chat_id))
+                    
+                    return True, f"Автоназначено: {operator_name} ({topic_name})"
+            
+            return False, "Ошибка автоназначения"
+
+    def create_auto_assign_rule(self, topic_id, operator_id, priority=1, max_chats=3):
+        """Создать правило автоназначения"""
+        with self.connection:
+            # Проверяем, не существует ли уже такое правило
+            existing = self.cursor.execute("""
+                SELECT id FROM auto_assign_rules 
+                WHERE topic_id = ? AND operator_id = ? AND is_active = 1
+            """, (topic_id, operator_id)).fetchone()
+            
+            if existing:
+                return False, "Такое правило уже существует!"
+            
+            self.cursor.execute("""
+                INSERT INTO auto_assign_rules (topic_id, operator_id, priority, max_chats)
+                VALUES (?, ?, ?, ?)
+            """, (topic_id, operator_id, priority, max_chats))
+            
+            return True, "Правило создано!"
+
+    def update_auto_assign_rule(self, rule_id, priority=None, max_chats=None, is_active=None):
+        """Обновить правило автоназначения"""
+        with self.connection:
+            updates = []
+            params = []
+            
+            if priority is not None:
+                updates.append("priority = ?")
+                params.append(priority)
+            
+            if max_chats is not None:
+                updates.append("max_chats = ?")
+                params.append(max_chats)
+            
+            if is_active is not None:
+                updates.append("is_active = ?")
+                params.append(is_active)
+            
+            if not updates:
+                return False, "Нет изменений"
+            
+            params.append(rule_id)
+            query = f"UPDATE auto_assign_rules SET {', '.join(updates)} WHERE id = ?"
+            self.cursor.execute(query, params)
+            
+            return True, "Правило обновлено!"
+
+    def delete_auto_assign_rule(self, rule_id):
+        """Удалить правило автоназначения"""
+        with self.connection:
+            self.cursor.execute("DELETE FROM auto_assign_rules WHERE id = ?", (rule_id,))
+            return True, "Правило удалено!"
+
+    def get_auto_assign_rules(self, topic_id=None, operator_id=None):
+        """Получить правила автоназначения"""
+        query = """
+            SELECT ar.id, ar.topic_id, ar.operator_id, ar.priority, ar.max_chats, ar.is_active,
+                   ct.name as topic_name, u.username as operator_name,
+                   COUNT(oc.id) as current_chats
+            FROM auto_assign_rules ar
+            LEFT JOIN chat_topics ct ON ar.topic_id = ct.id
+            LEFT JOIN users u ON ar.operator_id = u.user_id
+            LEFT JOIN operator_chats oc ON ar.operator_id = oc.operator_id AND oc.is_active = 1
+        """
+        
+        conditions = []
+        params = []
+        
+        if topic_id:
+            conditions.append("ar.topic_id = ?")
+            params.append(topic_id)
+        
+        if operator_id:
+            conditions.append("ar.operator_id = ?")
+            params.append(operator_id)
+        
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        
+        query += " GROUP BY ar.id ORDER BY ar.priority ASC"
+        
+        return self.cursor.execute(query, params).fetchall()
+
+    def get_registered_chats(self, status=None):
+        """Получить зарегистрированные чаты"""
+        query = """
+            SELECT cr.*, u.username as admin_name,
+                   op.username as operator_name, ct.name as topic_name
+            FROM chat_registrations cr
+            LEFT JOIN users u ON cr.registered_by = u.user_id
+            LEFT JOIN users op ON cr.assigned_operator_id = op.user_id
+            LEFT JOIN chat_topics ct ON cr.assigned_topic_id = ct.id
+        """
+        
+        params = []
+        if status is not None:
+            query += " WHERE cr.is_approved = ?"
+            params.append(status)
+        
+        query += " ORDER BY cr.registered_at DESC"
+        
+        return self.cursor.execute(query, params).fetchall()
+
+    def manually_assign_chat(self, chat_id, operator_id, topic_id):
+        """Вручную назначить оператора и тему чату"""
+        with self.connection:
+            # Проверяем существование чата
+            chat_info = self.cursor.execute(
+                "SELECT chat_title FROM chat_registrations WHERE chat_id = ?",
+                (chat_id,)
+            ).fetchone()
+            
+            if not chat_info:
+                return False, "Чат не найден!"
+            
+            chat_title = chat_info[0]
+            
+            # Привязываем чат
+            success, message = self.bind_chat_to_operator(
+                operator_id, chat_id, chat_title, topic_id
+            )
+            
+            if success:
+                # Обновляем регистрацию
+                self.cursor.execute("""
+                    UPDATE chat_registrations 
+                    SET is_approved = 1, assigned_operator_id = ?, assigned_topic_id = ?, auto_assign = 0
+                    WHERE chat_id = ?
+                """, (operator_id, topic_id, chat_id))
+                
+                return True, f"Чат назначен вручную: оператор {operator_id}, тема {topic_id}"
+            
+            return False, message
+
+    def get_setting(self, key, default=None):
+        """Получить настройку"""
+        res = self.cursor.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return res[0] if res else default
+
+    def set_setting(self, key, value):
+        """Установить настройку"""
+        with self.connection:
+            self.cursor.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (key, str(value))
+            )
+
 # --- КОНФИГУРАЦИЯ БОТА ---
 
 TOKEN = "8168150477:AAGX0s9L3KTIBB0X-wuFke7AIVUPcXaBigU"
@@ -1331,6 +1688,15 @@ class Form(StatesGroup):
     # Состояния для скрытой надбавки времени
     waiting_for_hidden_bonus_tariff = State()
     waiting_for_hidden_bonus_minutes = State()
+    # Состояния для автоназначения
+    waiting_for_auto_rule_topic = State()
+    waiting_for_auto_rule_operator = State()
+    waiting_for_auto_rule_priority = State()
+    waiting_for_auto_rule_max_chats = State()
+    # Состояния для ручного назначения чатов
+    waiting_for_manual_assign_chat = State()
+    waiting_for_manual_assign_operator = State()
+    waiting_for_manual_assign_topic = State()
     # Состояния для привязки/отвязки чатов
     waiting_for_chat_to_bind = State()
     waiting_for_chat_type = State()  # Для выбора типа чата
@@ -1518,6 +1884,121 @@ async def start_cmd(message: types.Message):
         welcome_text = f"📢 **Важное сообщение:**\n{system_message}\n\n{welcome_text}"
     
     await message.answer(welcome_text, reply_markup=get_main_menu(message.from_user.id), parse_mode="None")
+
+# Обработчик добавления/удаления бота из чата
+@dp.chat_member()
+async def chat_member_handler(update: types.ChatMemberUpdated):
+    """Обработчик добавления/удаления бота из чата"""
+    try:
+        # Проверяем, что это добавление бота
+        if update.new_chat_member.user.id == bot.id and update.new_chat_member.status == "member":
+            chat_id = update.chat.id
+            chat_title = update.chat.title or "Личные сообщения"
+            chat_type = update.chat.type
+            
+            # Кто добавил бота
+            added_by = update.from_user.id if update.from_user else None
+            
+            # Регистрируем чат
+            success, reg_message = db.register_chat(chat_id, chat_title, chat_type, added_by)
+            
+            if success:
+                # Получаем приветственное сообщение
+                welcome_msg = db.get_setting('new_chat_message', '👋 Бот добавлен в чат! Ожидайте назначения оператора...')
+                
+                # Отправляем сообщение в чат
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        f"{welcome_msg}\n\n"
+                        f"📝 **Чат:** {chat_title}\n"
+                        f"🆔 **ID:** `{chat_id}`\n"
+                        f"👥 **Тип:** {'Группа' if chat_type != 'private' else 'Личные сообщения'}\n\n"
+                        f"⏳ *Запрос отправлен администраторам...*",
+                        parse_mode="None"
+                    )
+                except Exception as e:
+                    logging.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
+                
+                # Уведомляем админов
+                if db.get_setting('auto_assign_notify_admins', '1') == '1':
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            if reg_message == "auto_assigned":
+                                # Получаем информацию о назначении
+                                reg_info = db.cursor.execute("""
+                                    SELECT cr.assigned_operator_id, cr.assigned_topic_id,
+                                           op.username, ct.name
+                                    FROM chat_registrations cr
+                                    LEFT JOIN users op ON cr.assigned_operator_id = op.user_id
+                                    LEFT JOIN chat_topics ct ON cr.assigned_topic_id = ct.id
+                                    WHERE cr.chat_id = ?
+                                """, (chat_id,)).fetchone()
+                                
+                                if reg_info:
+                                    operator_id, topic_id, operator_name, topic_name = reg_info
+                                    operator_name = operator_name or f"ID{operator_id}"
+                                    topic_name = topic_name or f"Тема {topic_id}"
+                                    
+                                    await bot.send_message(
+                                        admin_id,
+                                        f"🤖 **Бот добавлен в новый чат!**\n\n"
+                                        f"📝 **Чат:** {chat_title}\n"
+                                        f"🆔 **ID:** `{chat_id}`\n"
+                                        f"👥 **Добавил:** {added_by or 'Неизвестно'}\n\n"
+                                        f"✅ **АВТОМАТИЧЕСКИ НАЗНАЧЕНО:**\n"
+                                        f"👤 **Оператор:** {operator_name}\n"
+                                        f"🏷️ **Тема:** {topic_name}\n\n"
+                                        f"📍 Для изменения зайдите в 'Управление чатами'",
+                                        parse_mode="None"
+                                    )
+                            else:
+                                await bot.send_message(
+                                    admin_id,
+                                    f"🤖 **Бот добавлен в новый чат!**\n\n"
+                                    f"📝 **Чат:** {chat_title}\n"
+                                    f"🆔 **ID:** `{chat_id}`\n"
+                                    f"👥 **Добавил:** {added_by or 'Неизвестно'}\n\n"
+                                    f"⏳ **Статус:** Ожидает назначения\n\n"
+                                    f"📍 Перейдите в 'Управление чатами' для назначения оператора",
+                                    parse_mode="None"
+                                )
+                        except Exception as e:
+                            logging.error(f"Не удалось уведомить админа {admin_id}: {e}")
+        
+        # Если бота удалили из чата
+        elif update.old_chat_member.user.id == bot.id and update.old_chat_member.status == "member" and update.new_chat_member.status == "left":
+            chat_id = update.chat.id
+            
+            # Отмечаем чат как неактивный
+            try:
+                # Отвязываем чат от оператора
+                db.unbind_chat_from_operator(chat_id)
+                
+                # Обновляем регистрацию
+                db.cursor.execute(
+                    "UPDATE chat_registrations SET is_approved = 2 WHERE chat_id = ?",
+                    (chat_id,)
+                )
+                
+                # Уведомляем админов
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await bot.send_message(
+                            admin_id,
+                            f"❌ **Бот удален из чата!**\n\n"
+                            f"🆔 **ID чата:** `{chat_id}`\n"
+                            f"📝 **Название:** {update.chat.title or 'Неизвестно'}\n\n"
+                            f"💬 Чат отвязан от оператора.",
+                            parse_mode="None"
+                        )
+                    except:
+                        pass
+            except Exception as e:
+                logging.error(f"Ошибка при обработке удаления из чата {chat_id}: {e}")
+    
+    except Exception as e:
+        logging.error(f"Ошибка в обработчике chat_member: {e}")
 
 @dp.message(Command("menu"))
 async def menu_cmd(message: types.Message):
@@ -2460,6 +2941,15 @@ async def profile_button_handler(callback: CallbackQuery):
 # АДМИН ПАНЕЛЬ
 # ============================================
 
+async def check_pending_chats_notification(bot: Bot, admin_id: int):
+    """Проверить и уведомить о новых чатах при открытии админ-панели"""
+    pending_chats = [c for c in db.get_registered_chats() if c[6] == 0]
+    
+    if pending_chats:
+        return f"\n🔔 **Есть новые чаты!** ({len(pending_chats)} ожидают назначения)\n"
+    
+    return ""
+
 @dp.message(Command("admin"))
 async def admin_cmd(message: types.Message):
     """Команда /admin - показать админ панель"""
@@ -2468,8 +2958,16 @@ async def admin_cmd(message: types.Message):
         return
     
     is_super_admin = message.from_user.id in ADMIN_IDS
+    
+    # Проверяем новые чаты для супер-админов
+    notification = ""
+    if is_super_admin:
+        notification = await check_pending_chats_notification(bot, message.from_user.id)
+    
+    text = f"{notification}⚙️ **Админ панель**\n\nВыберите действие:"
+    
     await message.answer(
-        "⚙️ **Админ панель**\n\nВыберите действие:",
+        text,
         reply_markup=get_admin_keyboard(is_super_admin),
         parse_mode="None"
     )
@@ -5017,36 +5515,649 @@ async def admin_chat_management_handler(callback: CallbackQuery):
         await callback.answer("❌ Только для главного админа", show_alert=True)
         return
     
-    # Получаем статистику по чатам
-    all_chats = db.get_all_bound_chats()
+    # Статистика
+    registered_chats = db.get_registered_chats()
+    pending_chats = len([c for c in registered_chats if c[6] == 0])  # is_approved = 0
+    approved_chats = len([c for c in registered_chats if c[6] == 1])  # is_approved = 1
+    auto_assigned = len([c for c in registered_chats if c[6] == 1 and c[9] == 1])  # auto_assign = 1
+    
+    # Получаем включен ли автоназначение
+    auto_enabled = db.get_setting('auto_assign_enabled', '1')
     
     text = "💬 **Управление чатами операторов**\n\n"
-    text += f"📊 **Всего привязанных чатов:** {len(all_chats)}\n\n"
+    text += f"📊 **Статистика:**\n"
+    text += f"• Всего зарегистрировано: {len(registered_chats)}\n"
+    text += f"• Ожидают назначения: {pending_chats}\n"
+    text += f"• Назначено: {approved_chats}\n"
+    text += f"• Автоназначено: {auto_assigned}\n"
+    text += f"• Автоназначение: {'✅ ВКЛ' if auto_enabled == '1' else '❌ ВЫКЛ'}\n\n"
     
-    if all_chats:
-        text += "📋 **Привязанные чаты:**\n"
-        for i, chat in enumerate(all_chats[:5], 1):  # Показываем первые 5
-            chat_id, chat_id_num, chat_title, created_at, operator_id, username, is_active = chat
-            safe_username = escape_markdown(username or f"ID{operator_id}")
-            created_date = created_at.split()[0] if created_at else "—"
-            text += f"{i}. **{chat_title or 'Без названия'}**\n"
-            text += f"   👤 Оператор: @{safe_username}\n"
-            text += f"   🆔 ID чата: `{chat_id_num}`\n"
-            text += f"   📅 Привязка: {created_date}\n\n"
-    
-        if len(all_chats) > 5:
-            text += f"... и еще {len(all_chats) - 5} чатов\n\n"
+    # Показываем последние 3 ожидающих чата
+    pending_list = [c for c in registered_chats if c[6] == 0][:3]
+    if pending_list:
+        text += "⏳ **Ожидают назначения:**\n"
+        for chat in pending_list:
+            chat_id, _, chat_title, chat_type, registered_by, registered_at, is_approved, _, _, _, _, admin_name, _, _ = chat
+            text += f"• {chat_title} (ID: `{chat_id}`)\n"
+        text += "\n"
     
     text += "Выберите действие:"
     
     buttons = [
+        [InlineKeyboardButton(text="⏳ Ожидающие чаты", callback_data="admin_pending_chats")],
+        [InlineKeyboardButton(text="📋 Все чаты", callback_data="admin_all_registered_chats")],
+        [InlineKeyboardButton(text="🎯 Ручное назначение", callback_data="admin_manual_assign")],
+        [InlineKeyboardButton(text="⚙️ Автоназначение", callback_data="admin_auto_assign_settings")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_chat_stats")],
         [InlineKeyboardButton(text="➕ Привязать чат/тему", callback_data="admin_bind_chat")],
         [InlineKeyboardButton(text="➖ Отвязать чат/тему", callback_data="admin_unbind_chat")],
-        [InlineKeyboardButton(text="📋 Список чатов", callback_data="admin_chats_list")],
-        [InlineKeyboardButton(text="🔙 В админ-панель", callback_data="admin_panel_back")]
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel_back")]
     ]
     
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Обработчики для ожидающих чатов
+@dp.callback_query(F.data == "admin_pending_chats")
+async def admin_pending_chats_handler(callback: CallbackQuery):
+    """Список чатов, ожидающих назначения"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    pending_chats = [c for c in db.get_registered_chats() if c[6] == 0]  # is_approved = 0
+    
+    if not pending_chats:
+        await callback.message.edit_text(
+            "✅ **Нет чатов, ожидающих назначения!**\n\nВсе чаты уже распределены.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")]
+            ]),
+            parse_mode="None"
+        )
+        return
+    
+    # Показываем первый чат из списка
+    chat = pending_chats[0]
+    (chat_id, _, chat_title, chat_type, registered_by, registered_at, 
+     is_approved, assigned_operator_id, assigned_topic_id, auto_assign, 
+     _, admin_name, operator_name, topic_name) = chat
+    
+    registered_date = registered_at.split()[0] if registered_at else "—"
+    
+    text = f"⏳ **Чат ожидает назначения**\n\n"
+    text += f"📝 **Название:** {chat_title}\n"
+    text += f"🆔 **ID:** `{chat_id}`\n"
+    text += f"👥 **Тип:** {chat_type}\n"
+    text += f"👤 **Добавил:** {admin_name or registered_by}\n"
+    text += f"📅 **Дата:** {registered_date}\n\n"
+    
+    if len(pending_chats) > 1:
+        text += f"📋 **Еще ожидают:** {len(pending_chats) - 1} чатов\n\n"
+    
+    text += "Выберите действие:"
+    
+    buttons = [
+        [InlineKeyboardButton(text="🎯 Назначить оператора", callback_data=f"manual_assign_{chat_id}")],
+        [InlineKeyboardButton(text="🤖 Автоназначить", callback_data=f"auto_assign_chat_{chat_id}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_chat_{chat_id}")],
+        [InlineKeyboardButton(text="📋 Все ожидающие", callback_data="admin_pending_list")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")]
+    ]
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Обработчик автоназначения одного чата
+@dp.callback_query(F.data.startswith("auto_assign_chat_"))
+async def auto_assign_chat_handler(callback: CallbackQuery):
+    """Автоматически назначить оператора чату"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    chat_id = int(callback.data.split("_")[3])
+    
+    # Пытаемся автоназначить
+    success, message = db.auto_assign_chat(chat_id)
+    
+    if success:
+        # Получаем информацию о назначении
+        reg_info = db.cursor.execute("""
+            SELECT cr.chat_title, cr.assigned_operator_id, cr.assigned_topic_id,
+                   op.username, ct.name
+            FROM chat_registrations cr
+            LEFT JOIN users op ON cr.assigned_operator_id = op.user_id
+            LEFT JOIN chat_topics ct ON cr.assigned_topic_id = ct.id
+            WHERE cr.chat_id = ?
+        """, (chat_id,)).fetchone()
+        
+        if reg_info:
+            chat_title, operator_id, topic_id, operator_name, topic_name = reg_info
+            operator_name = operator_name or f"ID{operator_id}"
+            topic_name = topic_name or f"Тема {topic_id}"
+            
+            # Уведомляем оператора
+            try:
+                await bot.send_message(
+                    operator_id,
+                    f"🎯 **Вам назначен новый чат!**\n\n"
+                    f"📝 **Чат:** {chat_title}\n"
+                    f"🆔 **ID:** `{chat_id}`\n"
+                    f"🏷️ **Тема:** {topic_name}\n\n"
+                    f"Теперь вы можете работать в этом чате с помощью команды /number",
+                    parse_mode="None"
+                )
+            except:
+                pass
+            
+            await callback.message.edit_text(
+                f"✅ **Чат автоназначен!**\n\n"
+                f"📝 **Чат:** {chat_title}\n"
+                f"👤 **Оператор:** {operator_name}\n"
+                f"🏷️ **Тема:** {topic_name}\n\n"
+                f"Оператор уведомлен о назначении.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")]
+                ]),
+                parse_mode="None"
+            )
+        else:
+            await callback.message.edit_text(
+                f"✅ {message}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")]
+                ]),
+                parse_mode="None"
+            )
+    else:
+        await callback.message.edit_text(
+            f"❌ **Не удалось автоназначить!**\n\n{message}\n\n"
+            f"Попробуйте назначить вручную.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎯 Назначить вручную", callback_data=f"manual_assign_{chat_id}")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")]
+            ]),
+            parse_mode="None"
+        )
+
+# Меню ручного назначения
+@dp.callback_query(F.data == "admin_manual_assign")
+async def admin_manual_assign_handler(callback: CallbackQuery):
+    """Меню ручного назначения чатов"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    # Получаем ожидающие чаты
+    pending_chats = [c for c in db.get_registered_chats() if c[6] == 0]
+    
+    if not pending_chats:
+        await callback.message.edit_text(
+            "✅ **Нет чатов для ручного назначения!**\n\nВсе чаты уже распределены.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")]
+            ]),
+            parse_mode="None"
+        )
+        return
+    
+    text = "🎯 **Ручное назначение чатов**\n\n"
+    text += f"⏳ **Ожидают назначения:** {len(pending_chats)} чатов\n\n"
+    text += "Выберите чат для назначения:"
+    
+    buttons = []
+    for chat in pending_chats[:10]:  # Показываем первые 10
+        chat_id, _, chat_title, _, _, _, _, _, _, _, _, admin_name, _, _ = chat
+        button_text = f"📝 {chat_title[:20]}{'...' if len(chat_title) > 20 else ''}"
+        buttons.append([InlineKeyboardButton(
+            text=button_text,
+            callback_data=f"manual_assign_{chat_id}"
+        )])
+    
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")])
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Обработчик ручного назначения
+@dp.callback_query(F.data.startswith("manual_assign_"))
+async def manual_assign_start_handler(callback: CallbackQuery, state: FSMContext):
+    """Начать ручное назначение чата"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    chat_id = int(callback.data.split("_")[2])
+    
+    # Получаем информацию о чате
+    chat_info = db.cursor.execute(
+        "SELECT chat_title FROM chat_registrations WHERE chat_id = ?",
+        (chat_id,)
+    ).fetchone()
+    
+    if not chat_info:
+        await callback.answer("❌ Чат не найден!", show_alert=True)
+        return
+    
+    chat_title = chat_info[0]
+    
+    # Сохраняем данные
+    await state.update_data(assign_chat_id=chat_id, assign_chat_title=chat_title)
+    await state.set_state(Form.waiting_for_manual_assign_topic)
+    
+    # Получаем список тем
+    topics = db.get_all_topics()
+    
+    text = f"🎯 **Назначение чата: {chat_title}**\n\n"
+    text += f"🆔 **ID чата:** `{chat_id}`\n\n"
+    text += "Шаг 1 из 2\n\n"
+    text += "Выберите тему для чата:"
+    
+    buttons = []
+    for topic in topics:
+        topic_id, name, description, _ = topic
+        button_text = f"🏷️ {name}"
+        if description:
+            button_text += f" - {description[:20]}"
+        buttons.append([InlineKeyboardButton(
+            text=button_text,
+            callback_data=f"assign_topic_{topic_id}"
+        )])
+    
+    buttons.append([InlineKeyboardButton(text="❌ Без темы", callback_data="assign_topic_0")])
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_manual_assign")])
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Обработка выбора темы
+@dp.callback_query(F.data.startswith("assign_topic_"))
+async def assign_topic_handler(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора темы для чата"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    topic_id = int(callback.data.split("_")[2])
+    
+    # Сохраняем тему
+    await state.update_data(assign_topic_id=topic_id if topic_id != 0 else None)
+    await state.set_state(Form.waiting_for_manual_assign_operator)
+    
+    # Получаем список операторов
+    admins = db.get_admins_list()
+    
+    # Фильтруем только обычных операторов (не супер-админов)
+    regular_operators = [a for a in admins if a[0] not in ADMIN_IDS]
+    
+    if not regular_operators:
+        await callback.answer("❌ Нет доступных операторов!", show_alert=True)
+        await state.clear()
+        return
+    
+    data = await state.get_data()
+    chat_title = data.get('assign_chat_title', 'Чат')
+    
+    # Получаем информацию о теме
+    topic_name = "Без темы"
+    if topic_id != 0:
+        topic_info = db.get_topic_by_id(topic_id)
+        if topic_info:
+            topic_name = topic_info[1]
+    
+    text = f"🎯 **Назначение чата: {chat_title}**\n\n"
+    text += f"🏷️ **Тема:** {topic_name}\n\n"
+    text += "Шаг 2 из 2\n\n"
+    text += "Выберите оператора:"
+    
+    buttons = []
+    for operator in regular_operators:
+        operator_id, username = operator
+        button_text = f"👤 {username or f'ID{operator_id}'}"
+        
+        # Показываем текущую нагрузку
+        current_chats = db.cursor.execute(
+            "SELECT COUNT(*) FROM operator_chats WHERE operator_id = ? AND is_active = 1",
+            (operator_id,)
+        ).fetchone()[0]
+        
+        button_text += f" ({current_chats} чатов)"
+        
+        buttons.append([InlineKeyboardButton(
+            text=button_text,
+            callback_data=f"assign_operator_{operator_id}"
+        )])
+    
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_manual_assign")])
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Обработка выбора оператора
+@dp.callback_query(F.data.startswith("assign_operator_"))
+async def assign_operator_handler(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора оператора для чата"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    operator_id = int(callback.data.split("_")[2])
+    
+    data = await state.get_data()
+    chat_id = data.get('assign_chat_id')
+    chat_title = data.get('assign_chat_title', 'Чат')
+    topic_id = data.get('assign_topic_id')
+    
+    if not chat_id:
+        await callback.answer("❌ Ошибка: не найден ID чата", show_alert=True)
+        await state.clear()
+        return
+    
+    # Получаем информацию об операторе
+    operator_info = db.cursor.execute(
+        "SELECT username FROM users WHERE user_id = ?",
+        (operator_id,)
+    ).fetchone()
+    operator_name = operator_info[0] if operator_info else f"ID{operator_id}"
+    
+    # Получаем информацию о теме
+    topic_name = "Без темы"
+    if topic_id:
+        topic_info = db.get_topic_by_id(topic_id)
+        if topic_info:
+            topic_name = topic_info[1]
+    
+    # Назначаем чат
+    success, message = db.manually_assign_chat(chat_id, operator_id, topic_id)
+    
+    if success:
+        # Уведомляем оператора
+        try:
+            await bot.send_message(
+                operator_id,
+                f"🎯 **Вам назначен новый чат!**\n\n"
+                f"📝 **Чат:** {chat_title}\n"
+                f"🆔 **ID:** `{chat_id}`\n"
+                f"🏷️ **Тема:** {topic_name}\n\n"
+                f"Теперь вы можете работать в этом чате с помощью команды /number",
+                parse_mode="None"
+            )
+        except:
+            pass
+        
+        await callback.message.edit_text(
+            f"✅ **Чат успешно назначен!**\n\n"
+            f"📝 **Чат:** {chat_title}\n"
+            f"🆔 **ID:** `{chat_id}`\n"
+            f"👤 **Оператор:** {operator_name}\n"
+            f"🏷️ **Тема:** {topic_name}\n\n"
+            f"Оператор уведомлен о назначении.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")]
+            ]),
+            parse_mode="None"
+        )
+    else:
+        await callback.message.edit_text(
+            f"❌ **Ошибка назначения!**\n\n{message}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")]
+            ]),
+            parse_mode="None"
+        )
+    
+    await state.clear()
+
+# Меню автоназначения
+@dp.callback_query(F.data == "admin_auto_assign_settings")
+async def admin_auto_assign_settings_handler(callback: CallbackQuery):
+    """Настройки автоназначения"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    auto_enabled = db.get_setting('auto_assign_enabled', '1')
+    notify_admins = db.get_setting('auto_assign_notify_admins', '1')
+    
+    # Получаем правила
+    rules = db.get_auto_assign_rules()
+    
+    text = "⚙️ **Настройки автоназначения**\n\n"
+    text += f"📊 **Статус:** {'✅ ВКЛЮЧЕНО' if auto_enabled == '1' else '❌ ВЫКЛЮЧЕНО'}\n"
+    text += f"🔔 **Уведомления:** {'✅ ВКЛ' if notify_admins == '1' else '❌ ВЫКЛ'}\n\n"
+    
+    if rules:
+        text += "📋 **Правила автоназначения:**\n\n"
+        for rule in rules:
+            rule_id, topic_id, operator_id, priority, max_chats, is_active, topic_name, operator_name, current_chats = rule
+            status = "✅" if is_active == 1 else "❌"
+            text += f"{status} **{topic_name}** → **{operator_name}**\n"
+            text += f"   🏆 Приоритет: {priority} | "
+            text += f"🗂️ Чатов: {current_chats}/{max_chats}\n\n"
+    
+    text += "Выберите действие:"
+    
+    buttons = [
+        [InlineKeyboardButton(text=f"{'❌ ВЫКЛ' if auto_enabled == '1' else '✅ ВКЛ'} автоназначение", 
+                             callback_data="toggle_auto_assign")],
+        [InlineKeyboardButton(text="➕ Добавить правило", callback_data="admin_add_auto_rule")],
+        [InlineKeyboardButton(text="📋 Правила по темам", callback_data="admin_auto_rules_by_topic")],
+        [InlineKeyboardButton(text="📋 Правила по операторам", callback_data="admin_auto_rules_by_operator")],
+        [InlineKeyboardButton(text="⚙️ Настройки уведомлений", callback_data="admin_auto_notify_settings")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")]
+    ]
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Обработчик переключения автоназначения
+@dp.callback_query(F.data == "toggle_auto_assign")
+async def toggle_auto_assign_handler(callback: CallbackQuery):
+    """Включить/выключить автоназначение"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    current = db.get_setting('auto_assign_enabled', '1')
+    new_value = '0' if current == '1' else '1'
+    
+    db.set_setting('auto_assign_enabled', new_value)
+    
+    action = "ВКЛЮЧЕНО" if new_value == '1' else "ВЫКЛЮЧЕНО"
+    await callback.answer(f"✅ Автоназначение {action}", show_alert=True)
+    await admin_auto_assign_settings_handler(callback)
+
+# Добавление правила автоназначения
+@dp.callback_query(F.data == "admin_add_auto_rule")
+async def admin_add_auto_rule_handler(callback: CallbackQuery, state: FSMContext):
+    """Добавление правила автоназначения"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    await state.set_state(Form.waiting_for_auto_rule_topic)
+    
+    # Получаем список тем
+    topics = db.get_all_topics()
+    
+    text = "➕ **Добавление правила автоназначения**\n\n"
+    text += "Шаг 1 из 3\n\n"
+    text += "Выберите тему:"
+    
+    buttons = []
+    for topic in topics:
+        topic_id, name, description, _ = topic
+        button_text = f"🏷️ {name}"
+        if description:
+            button_text += f" - {description[:20]}"
+        buttons.append([InlineKeyboardButton(
+            text=button_text,
+            callback_data=f"auto_rule_topic_{topic_id}"
+        )])
+    
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_auto_assign_settings")])
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Продолжение создания правила
+@dp.callback_query(F.data.startswith("auto_rule_topic_"))
+async def auto_rule_topic_handler(callback: CallbackQuery, state: FSMContext):
+    """Выбор темы для правила автоназначения"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    topic_id = int(callback.data.split("_")[3])
+    
+    # Получаем информацию о теме
+    topic_info = db.get_topic_by_id(topic_id)
+    if not topic_info:
+        await callback.answer("❌ Тема не найдена!", show_alert=True)
+        return
+    
+    topic_name = topic_info[1]
+    
+    # Сохраняем тему
+    await state.update_data(auto_rule_topic_id=topic_id, auto_rule_topic_name=topic_name)
+    await state.set_state(Form.waiting_for_auto_rule_operator)
+    
+    # Получаем список операторов
+    admins = db.get_admins_list()
+    regular_operators = [a for a in admins if a[0] not in ADMIN_IDS]
+    
+    text = f"➕ **Добавление правила автоназначения**\n\n"
+    text += f"🏷️ **Тема:** {topic_name}\n\n"
+    text += "Шаг 2 из 3\n\n"
+    text += "Выберите оператора:"
+    
+    buttons = []
+    for operator in regular_operators:
+        operator_id, username = operator
+        button_text = f"👤 {username or f'ID{operator_id}'}"
+        
+        # Показываем текущую нагрузку
+        current_chats = db.cursor.execute(
+            "SELECT COUNT(*) FROM operator_chats WHERE operator_id = ? AND is_active = 1",
+            (operator_id,)
+        ).fetchone()[0]
+        
+        button_text += f" ({current_chats} чатов)"
+        
+        buttons.append([InlineKeyboardButton(
+            text=button_text,
+            callback_data=f"auto_rule_operator_{operator_id}"
+        )])
+    
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_auto_assign_settings")])
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Завершение создания правила
+@dp.callback_query(F.data.startswith("auto_rule_operator_"))
+async def auto_rule_operator_handler(callback: CallbackQuery, state: FSMContext):
+    """Выбор оператора для правила автоназначения"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    operator_id = int(callback.data.split("_")[3])
+    
+    # Получаем информацию об операторе
+    operator_info = db.cursor.execute(
+        "SELECT username FROM users WHERE user_id = ?",
+        (operator_id,)
+    ).fetchone()
+    operator_name = operator_info[0] if operator_info else f"ID{operator_id}"
+    
+    data = await state.get_data()
+    topic_id = data.get('auto_rule_topic_id')
+    topic_name = data.get('auto_rule_topic_name')
+    
+    if not topic_id:
+        await callback.answer("❌ Ошибка: тема не выбрана", show_alert=True)
+        await state.clear()
+        return
+    
+    # Сохраняем оператора
+    await state.update_data(auto_rule_operator_id=operator_id, auto_rule_operator_name=operator_name)
+    await state.set_state(Form.waiting_for_auto_rule_priority)
+    
+    text = f"➕ **Добавление правила автоназначения**\n\n"
+    text += f"🏷️ **Тема:** {topic_name}\n"
+    text += f"👤 **Оператор:** {operator_name}\n\n"
+    text += "Шаг 3 из 3\n\n"
+    text += "Настройте правило:\n\n"
+    text += "1️⃣ **Приоритет** (1=высокий, 10=низкий):\n"
+    text += "2️⃣ **Макс. чатов** на оператора (1-10):\n\n"
+    text += "Отправьте в формате: `приоритет,макс_чатов`\n"
+    text += "Пример: `1,3` - высший приоритет, максимум 3 чата"
+    
+    buttons = [[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_auto_assign_settings")]]
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Обработка настроек правила
+@dp.message(Form.waiting_for_auto_rule_priority)
+async def process_auto_rule_settings(message: types.Message, state: FSMContext):
+    """Обработка настроек правила автоназначения"""
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ У вас нет прав доступа")
+        await state.clear()
+        return
+    
+    try:
+        # Парсим ввод
+        if ',' in message.text:
+            priority_str, max_chats_str = message.text.split(',', 1)
+        elif ' ' in message.text:
+            priority_str, max_chats_str = message.text.split(' ', 1)
+        else:
+            await message.answer("❌ Неверный формат! Используйте: `приоритет,макс_чатов`")
+            return
+        
+        priority = int(priority_str.strip())
+        max_chats = int(max_chats_str.strip())
+        
+        if priority < 1 or priority > 10:
+            await message.answer("❌ Приоритет должен быть от 1 до 10!")
+            return
+        
+        if max_chats < 1 or max_chats > 10:
+            await message.answer("❌ Максимум чатов должен быть от 1 до 10!")
+            return
+        
+        data = await state.get_data()
+        topic_id = data.get('auto_rule_topic_id')
+        operator_id = data.get('auto_rule_operator_id')
+        topic_name = data.get('auto_rule_topic_name')
+        operator_name = data.get('auto_rule_operator_name')
+        
+        # Создаем правило
+        success, result_message = db.create_auto_assign_rule(
+            topic_id, operator_id, priority, max_chats
+        )
+        
+        if success:
+            await message.answer(
+                f"✅ **Правило создано!**\n\n"
+                f"🏷️ **Тема:** {topic_name}\n"
+                f"👤 **Оператор:** {operator_name}\n"
+                f"🏆 **Приоритет:** {priority}\n"
+                f"🗂️ **Макс. чатов:** {max_chats}\n\n"
+                f"Теперь новые чаты в теме '{topic_name}' будут автоматически назначаться {operator_name}.",
+                parse_mode="None"
+            )
+        else:
+            await message.answer(f"❌ {result_message}", parse_mode="None")
+        
+        await state.clear()
+        # Обновляем меню автоназначения
+        callback_data = types.CallbackQuery(
+            id="fake",
+            from_user=message.from_user,
+            message=message,
+            chat_instance="fake",
+            data="admin_auto_assign_settings"
+        )
+        await admin_auto_assign_settings_handler(callback_data)
+        
+    except ValueError:
+        await message.answer("❌ Введите числа! Формат: `приоритет,макс_чатов`\nПример: `1,3`")
 
 # Привязка чата
 @dp.callback_query(F.data == "admin_bind_chat")
@@ -5866,22 +6977,64 @@ async def download_chats_report_handler(callback: CallbackQuery):
 # Команда для получения ID чата
 @dp.message(Command("chatid"))
 async def chatid_cmd(message: types.Message):
-    """Получить ID текущего чата"""
+    """Получить ID текущего чата и статус"""
     chat_id = message.chat.id
     chat_title = message.chat.title or "Личные сообщения"
     message_thread_id = getattr(message, 'message_thread_id', None)
     
-    text = (
-        f"💬 **Информация о чате**\n\n"
-        f"📝 **Название:** {chat_title}\n"
-        f"🆔 **ID чата:** `{chat_id}`\n"
-        f"👥 **Тип чата:** {message.chat.type}\n"
-    )
+    text = f"💬 **Информация о чате**\n\n"
+    text += f"📝 **Название:** {chat_title}\n"
+    text += f"🆔 **ID:** `{chat_id}`\n"
+    text += f"👥 **Тип чата:** {'Группа/Канал' if message.chat.type != 'private' else 'Личные сообщения'}\n"
     
     if message_thread_id:
         text += f"📌 **ID темы:** `{message_thread_id}`\n"
     
     text += "\n"
+    
+    # Проверяем регистрацию
+    reg_info = db.cursor.execute("""
+        SELECT cr.is_approved, cr.registered_at
+        FROM chat_registrations cr
+        WHERE cr.chat_id = ?
+    """, (chat_id,)).fetchone()
+    
+    if reg_info:
+        is_approved, registered_at = reg_info
+        registered_date = registered_at.split()[0] if registered_at else "—"
+        
+        if is_approved == 0:
+            text += f"📊 **Статус:** ⏳ Ожидает назначения\n"
+            text += f"📅 **Зарегистрирован:** {registered_date}"
+        elif is_approved == 1:
+            # Получаем детали
+            details = db.cursor.execute("""
+                SELECT op.username, ct.name, cr.auto_assign
+                FROM chat_registrations cr
+                LEFT JOIN users op ON cr.assigned_operator_id = op.user_id
+                LEFT JOIN chat_topics ct ON cr.assigned_topic_id = ct.id
+                WHERE cr.chat_id = ?
+            """, (chat_id,)).fetchone()
+            
+            if details:
+                operator_name, topic_name, auto_assign = details
+                operator_name = operator_name or "Неизвестно"
+                topic_name = topic_name or "Без темы"
+                assign_type = "автоматически" if auto_assign == 1 else "вручную"
+                
+                text += f"📊 **Статус:** ✅ Назначен ({assign_type})\n"
+                text += f"👤 **Оператор:** {operator_name}\n"
+                text += f"🏷️ **Тема:** {topic_name}\n"
+                text += f"📅 **Назначен:** {registered_date}"
+        else:
+            text += f"📊 **Статус:** ❌ Отклонен\n"
+            text += f"📅 **Зарегистрирован:** {registered_date}"
+    else:
+        text += "📊 **Статус:** ❌ Не зарегистрирован\n\n"
+        text += "💡 **Для регистрации:**\n"
+        text += "1. Убедитесь что бот добавлен в чат\n"
+        text += "2. Ожидайте автоматической регистрации\n"
+        text += "3. Или обратитесь к администратору"
     
     # Проверяем привязки
     if message_thread_id:
@@ -5893,9 +7046,9 @@ async def chatid_cmd(message: types.Message):
                 (operator_id,)
             ).fetchone()
             operator_name = operator_info[0] if operator_info else f"ID{operator_id}"
-            text += f"🔗 **Тема привязана к оператору:** @{operator_name} (ID: `{operator_id}`)\n"
+            text += f"\n\n🔗 **Тема привязана к оператору:** @{operator_name} (ID: `{operator_id}`)\n"
         else:
-            text += f"🔓 **Тема не привязана**\n"
+            text += f"\n\n🔓 **Тема не привязана**\n"
     else:
         # Проверяем общие привязки чата
         operator_id = db.get_operator_by_chat(chat_id)
@@ -5905,9 +7058,9 @@ async def chatid_cmd(message: types.Message):
                 (operator_id,)
             ).fetchone()
             operator_name = operator_info[0] if operator_info else f"ID{operator_id}"
-            text += f"🔗 **Чат привязан к оператору:** @{operator_name} (ID: `{operator_id}`)\n"
+            text += f"\n\n🔗 **Чат привязан к оператору:** @{operator_name} (ID: `{operator_id}`)\n"
         else:
-            text += f"🔓 **Чат не привязан**\n"
+            text += f"\n\n🔓 **Чат не привязан**\n"
     
     # Показываем все привязанные темы если это форум
     if message.chat.type == 'supergroup' and getattr(message.chat, 'is_forum', False):
@@ -5922,7 +7075,353 @@ async def chatid_cmd(message: types.Message):
                 operator_name = operator_info[0] if operator_info else f"ID{topic_operator_id}"
                 text += f"  • Тема #{topic_id} → @{operator_name}\n"
     
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text, parse_mode="None")
+
+@dp.message(Command("chatstatus"))
+async def chatstatus_cmd(message: types.Message):
+    """Проверить статус чата"""
+    chat_id = message.chat.id
+    chat_title = message.chat.title or "Личные сообщения"
+    
+    # Проверяем регистрацию
+    reg_info = db.cursor.execute("""
+        SELECT cr.is_approved, cr.assigned_operator_id, cr.assigned_topic_id,
+               op.username, ct.name, cr.auto_assign
+        FROM chat_registrations cr
+        LEFT JOIN users op ON cr.assigned_operator_id = op.user_id
+        LEFT JOIN chat_topics ct ON cr.assigned_topic_id = ct.id
+        WHERE cr.chat_id = ?
+    """, (chat_id,)).fetchone()
+    
+    if not reg_info:
+        text = "❌ **Чат не зарегистрирован**\n\n"
+        text += "Бот был добавлен, но еще не зарегистрирован в системе.\n"
+        text += "Ожидайте назначения оператора администратором."
+    else:
+        is_approved, operator_id, topic_id, operator_name, topic_name, auto_assign = reg_info
+        
+        if is_approved == 0:
+            text = "⏳ **Чат ожидает назначения**\n\n"
+            text += "Администратору отправлен запрос на назначение оператора.\n"
+            text += "Обычно это занимает несколько минут."
+        elif is_approved == 1:
+            operator_name = operator_name or f"ID{operator_id}"
+            topic_name = topic_name or "Без темы"
+            assign_type = "автоматически" if auto_assign == 1 else "вручную"
+            
+            text = "✅ **Чат назначен**\n\n"
+            text += f"📝 **Чат:** {chat_title}\n"
+            text += f"👤 **Оператор:** {operator_name}\n"
+            text += f"🏷️ **Тема:** {topic_name}\n"
+            text += f"🔧 **Назначен:** {assign_type}\n\n"
+            text += "Оператор может использовать команду /number для работы."
+        else:
+            text = "❌ **Чат отклонен**\n\n"
+            text += "Этот чат был отклонен администратором.\n"
+            text += "Обратитесь к администратору для уточнения деталей."
+    
+    await message.answer(text, parse_mode="None")
+
+@dp.message(Command("checkchats"))
+async def checkchats_cmd(message: types.Message):
+    """Проверить все чаты (только для админов)"""
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ У вас нет прав доступа к этой команде.")
+        return
+    
+    all_chats = db.get_registered_chats()
+    
+    if not all_chats:
+        await message.answer("📭 **Нет зарегистрированных чатов**")
+        return
+    
+    text = "📋 **Все зарегистрированные чаты**\n\n"
+    
+    pending_count = 0
+    approved_count = 0
+    rejected_count = 0
+    
+    for chat in all_chats[:20]:  # Показываем первые 20
+        (chat_id, _, chat_title, chat_type, _, registered_at, 
+         is_approved, assigned_operator_id, assigned_topic_id, auto_assign, 
+         _, admin_name, operator_name, topic_name) = chat
+        
+        status_emoji = {
+            0: "⏳",
+            1: "✅",
+            2: "❌"
+        }.get(is_approved, "❓")
+        
+        status_text = {
+            0: "Ожидает",
+            1: "Назначен",
+            2: "Отклонен"
+        }.get(is_approved, "Неизвестно")
+        
+        assign_type = "🤖" if auto_assign == 1 else "👤"
+        
+        # Счетчики
+        if is_approved == 0:
+            pending_count += 1
+        elif is_approved == 1:
+            approved_count += 1
+        else:
+            rejected_count += 1
+        
+        registered_date = registered_at.split()[0] if registered_at else "—"
+        
+        text += f"{status_emoji} {assign_type} **{chat_title}**\n"
+        text += f"   🆔 `{chat_id}` | {status_text} | {registered_date}\n"
+        
+        if operator_name:
+            text += f"   👤 Оператор: {operator_name}\n"
+        
+        if topic_name:
+            text += f"   🏷️ Тема: {topic_name}\n"
+        
+        text += "\n"
+    
+    if len(all_chats) > 20:
+        text += f"... и еще {len(all_chats) - 20} чатов\n\n"
+    
+    text += f"📊 **Итого:** {len(all_chats)} чатов\n"
+    text += f"⏳ Ожидают: {pending_count} | ✅ Назначены: {approved_count} | ❌ Отклонены: {rejected_count}"
+    
+    await message.answer(text, parse_mode="None")
+
+# Обработчик отклонения чата
+@dp.callback_query(F.data.startswith("reject_chat_"))
+async def reject_chat_handler(callback: CallbackQuery):
+    """Отклонить чат"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    chat_id = int(callback.data.split("_")[2])
+    
+    # Обновляем статус чата
+    db.cursor.execute(
+        "UPDATE chat_registrations SET is_approved = 2 WHERE chat_id = ?",
+        (chat_id,)
+    )
+    db.connection.commit()
+    
+    await callback.message.edit_text(
+        f"❌ **Чат отклонен!**\n\n"
+        f"🆔 **ID чата:** `{chat_id}`\n\n"
+        f"Чат был отклонен и не будет назначен оператору.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")]
+        ]),
+        parse_mode="None"
+    )
+
+# Просмотр всех зарегистрированных чатов
+@dp.callback_query(F.data == "admin_all_registered_chats")
+async def admin_all_registered_chats_handler(callback: CallbackQuery):
+    """Показать все зарегистрированные чаты"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    all_chats = db.get_registered_chats()
+    
+    if not all_chats:
+        await callback.message.edit_text(
+            "📭 **Нет зарегистрированных чатов**",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")]
+            ]),
+            parse_mode="None"
+        )
+        return
+    
+    text = "📋 **Все зарегистрированные чаты**\n\n"
+    
+    pending_count = 0
+    approved_count = 0
+    rejected_count = 0
+    
+    for chat in all_chats[:10]:  # Показываем первые 10
+        (chat_id, _, chat_title, chat_type, _, registered_at, 
+         is_approved, assigned_operator_id, assigned_topic_id, auto_assign, 
+         _, admin_name, operator_name, topic_name) = chat
+        
+        status_emoji = {
+            0: "⏳",
+            1: "✅",
+            2: "❌"
+        }.get(is_approved, "❓")
+        
+        status_text = {
+            0: "Ожидает",
+            1: "Назначен",
+            2: "Отклонен"
+        }.get(is_approved, "Неизвестно")
+        
+        assign_type = "🤖" if auto_assign == 1 else "👤"
+        
+        # Счетчики
+        if is_approved == 0:
+            pending_count += 1
+        elif is_approved == 1:
+            approved_count += 1
+        else:
+            rejected_count += 1
+        
+        registered_date = registered_at.split()[0] if registered_at else "—"
+        
+        text += f"{status_emoji} {assign_type} **{chat_title}**\n"
+        text += f"   🆔 `{chat_id}` | {status_text} | {registered_date}\n"
+        
+        if operator_name:
+            text += f"   👤 Оператор: {operator_name}\n"
+        
+        if topic_name:
+            text += f"   🏷️ Тема: {topic_name}\n"
+        
+        text += "\n"
+    
+    if len(all_chats) > 10:
+        text += f"... и еще {len(all_chats) - 10} чатов\n\n"
+    
+    text += f"📊 **Итого:** {len(all_chats)} чатов\n"
+    text += f"⏳ Ожидают: {pending_count} | ✅ Назначены: {approved_count} | ❌ Отклонены: {rejected_count}"
+    
+    buttons = [
+        [InlineKeyboardButton(text="📋 Список ожидающих", callback_data="admin_pending_chats")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")]
+    ]
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Статистика чатов
+@dp.callback_query(F.data == "admin_chat_stats")
+async def admin_chat_stats_handler(callback: CallbackQuery):
+    """Статистика по чатам"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    all_chats = db.get_registered_chats()
+    
+    pending_chats = len([c for c in all_chats if c[6] == 0])
+    approved_chats = len([c for c in all_chats if c[6] == 1])
+    rejected_chats = len([c for c in all_chats if c[6] == 2])
+    auto_assigned = len([c for c in all_chats if c[6] == 1 and c[9] == 1])
+    manual_assigned = approved_chats - auto_assigned
+    
+    # Статистика по операторам
+    operator_stats = db.cursor.execute("""
+        SELECT op.username, COUNT(*) as chat_count
+        FROM chat_registrations cr
+        LEFT JOIN users op ON cr.assigned_operator_id = op.user_id
+        WHERE cr.is_approved = 1 AND op.user_id IS NOT NULL
+        GROUP BY op.user_id
+        ORDER BY chat_count DESC
+        LIMIT 5
+    """).fetchall()
+    
+    text = "📊 **Статистика по чатам**\n\n"
+    text += f"📈 **Общая статистика:**\n"
+    text += f"• Всего зарегистрировано: {len(all_chats)}\n"
+    text += f"• Ожидают назначения: {pending_chats}\n"
+    text += f"• Назначено: {approved_chats}\n"
+    text += f"  └ Автоназначено: {auto_assigned}\n"
+    text += f"  └ Назначено вручную: {manual_assigned}\n"
+    text += f"• Отклонено: {rejected_chats}\n\n"
+    
+    if operator_stats:
+        text += "👤 **Топ операторов:**\n"
+        for i, (username, count) in enumerate(operator_stats, 1):
+            operator_name = username or "Неизвестно"
+            text += f"{i}. {operator_name}: {count} чатов\n"
+    
+    buttons = [[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")]]
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Просмотр правил по темам
+@dp.callback_query(F.data == "admin_auto_rules_by_topic")
+async def admin_auto_rules_by_topic_handler(callback: CallbackQuery):
+    """Показать правила автоназначения по темам"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    topics = db.get_all_topics()
+    
+    if not topics:
+        await callback.message.edit_text(
+            "❌ **Нет тем!**\n\nСначала создайте темы в системе.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_auto_assign_settings")]
+            ]),
+            parse_mode="None"
+        )
+        return
+    
+    text = "📋 **Правила автоназначения по темам**\n\n"
+    
+    for topic in topics:
+        topic_id, topic_name, description, _ = topic
+        rules = db.get_auto_assign_rules(topic_id=topic_id)
+        
+        text += f"🏷️ **{topic_name}**\n"
+        if rules:
+            for rule in rules:
+                rule_id, _, operator_id, priority, max_chats, is_active, _, operator_name, current_chats = rule
+                status = "✅" if is_active == 1 else "❌"
+                text += f"  {status} → {operator_name} (Приоритет: {priority}, Чатов: {current_chats}/{max_chats})\n"
+        else:
+            text += "  ❌ Нет правил\n"
+        text += "\n"
+    
+    buttons = [[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_auto_assign_settings")]]
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Просмотр правил по операторам
+@dp.callback_query(F.data == "admin_auto_rules_by_operator")
+async def admin_auto_rules_by_operator_handler(callback: CallbackQuery):
+    """Показать правила автоназначения по операторам"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    admins = db.get_admins_list()
+    regular_operators = [a for a in admins if a[0] not in ADMIN_IDS]
+    
+    if not regular_operators:
+        await callback.message.edit_text(
+            "❌ **Нет операторов!**\n\nСначала добавьте операторов в систему.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_auto_assign_settings")]
+            ]),
+            parse_mode="None"
+        )
+        return
+    
+    text = "📋 **Правила автоназначения по операторам**\n\n"
+    
+    for operator in regular_operators:
+        operator_id, username = operator
+        operator_name = username or f"ID{operator_id}"
+        rules = db.get_auto_assign_rules(operator_id=operator_id)
+        
+        text += f"👤 **{operator_name}**\n"
+        if rules:
+            for rule in rules:
+                rule_id, topic_id, _, priority, max_chats, is_active, topic_name, _, current_chats = rule
+                status = "✅" if is_active == 1 else "❌"
+                text += f"  {status} ← {topic_name} (Приоритет: {priority}, Чатов: {current_chats}/{max_chats})\n"
+        else:
+            text += "  ❌ Нет правил\n"
+        text += "\n"
+    
+    buttons = [[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_auto_assign_settings")]]
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
 
 # Команда для операторов чтобы посмотреть свои чаты
 @dp.message(Command("mychats"))
