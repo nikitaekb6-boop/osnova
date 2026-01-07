@@ -121,6 +121,18 @@ class Database:
                     FOREIGN KEY (tariff_id) REFERENCES tariffs (id)
                 )
             """)
+            # Таблица для привязки чатов к операторам
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS operator_chats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operator_id INTEGER,
+                    chat_id INTEGER,
+                    chat_title TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (operator_id) REFERENCES users (user_id)
+                )
+            """)
             
             # Инициализация настроек
             settings = [
@@ -237,6 +249,21 @@ class Database:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (referrer_id) REFERENCES users (user_id),
                     FOREIGN KEY (referred_id) REFERENCES users (user_id)
+                )
+            """)
+        except:
+            pass
+        # Создаем таблицу operator_chats если ее нет
+        try:
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS operator_chats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operator_id INTEGER,
+                    chat_id INTEGER,
+                    chat_title TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (operator_id) REFERENCES users (user_id)
                 )
             """)
         except:
@@ -1034,56 +1061,6 @@ class Database:
             LIMIT ?
         """, (limit,)).fetchall()
 
-    def get_numbers_by_date(self, date_str=None, limit=10):
-        """Получить номера за определенную дату или все"""
-        if date_str:
-            query = """
-                SELECT n.phone, u.username, n.status, t.name, n.created_at
-                FROM numbers n
-                LEFT JOIN users u ON n.user_id = u.user_id
-                LEFT JOIN tariffs t ON n.tariff_id = t.id
-                WHERE DATE(n.created_at) = ?
-                ORDER BY n.created_at DESC
-                LIMIT ?
-            """
-            return self.cursor.execute(query, (date_str, limit)).fetchall()
-        else:
-            # Получить последние номера (как раньше)
-            return self.cursor.execute("""
-                SELECT n.phone, u.username, n.status, t.name, n.created_at
-                FROM numbers n
-                LEFT JOIN users u ON n.user_id = u.user_id
-                LEFT JOIN tariffs t ON n.tariff_id = t.id
-                ORDER BY n.created_at DESC
-                LIMIT ?
-            """, (limit,)).fetchall()
-
-    def get_all_numbers_by_date_raw(self, date_str=None):
-        """Получить все номера за определенную дату (для скачивания)"""
-        if date_str:
-            query = """
-                SELECT n.id, n.phone, u.username, n.status, t.name, n.created_at, n.finished_at
-                FROM numbers n 
-                LEFT JOIN users u ON n.user_id = u.user_id
-                LEFT JOIN tariffs t ON n.tariff_id = t.id
-                WHERE DATE(n.created_at) = ?
-                ORDER BY n.created_at DESC
-            """
-            return self.cursor.execute(query, (date_str,)).fetchall()
-        else:
-            # Все номера (как раньше)
-            return self.get_all_numbers_raw()
-
-    def get_available_dates(self):
-        """Получить список дат, за которые есть данные"""
-        return self.cursor.execute("""
-            SELECT DISTINCT DATE(created_at) as date 
-            FROM numbers 
-            WHERE created_at IS NOT NULL 
-            ORDER BY date DESC
-            LIMIT 30  -- последние 30 дней
-        """).fetchall()
-
     def get_user_position(self, user_id):
         target = self.cursor.execute("""
             SELECT created_at, is_priority 
@@ -1141,6 +1118,75 @@ class Database:
             FROM users WHERE user_id = ?
         """, (user_id,)).fetchone()
 
+    # УПРАВЛЕНИЕ ЧАТАМИ ОПЕРАТОРОВ
+    def bind_chat_to_operator(self, operator_id, chat_id, chat_title):
+        """Привязать чат к оператору"""
+        with self.connection:
+            # Проверяем, привязан ли уже этот чат
+            existing = self.cursor.execute(
+                "SELECT id FROM operator_chats WHERE chat_id = ? AND is_active = 1",
+                (chat_id,)
+            ).fetchone()
+            
+            if existing:
+                return False, "❌ Этот чат уже привязан к другому оператору!"
+            
+            # Проверяем, является ли пользователь оператором
+            if not self.is_admin(operator_id):
+                return False, "❌ Пользователь не является оператором!"
+            
+            # Привязываем чат
+            self.cursor.execute(
+                "INSERT INTO operator_chats (operator_id, chat_id, chat_title) VALUES (?, ?, ?)",
+                (operator_id, chat_id, chat_title)
+            )
+            return True, "✅ Чат успешно привязан к оператору!"
+
+    def unbind_chat_from_operator(self, chat_id):
+        """Отвязать чат от оператора"""
+        with self.connection:
+            # Проверяем, привязан ли чат
+            existing = self.cursor.execute(
+                "SELECT id, operator_id FROM operator_chats WHERE chat_id = ? AND is_active = 1",
+                (chat_id,)
+            ).fetchone()
+            
+            if not existing:
+                return False, "❌ Этот чат не привязан ни к одному оператору!"
+            
+            # Отвязываем чат
+            self.cursor.execute(
+                "UPDATE operator_chats SET is_active = 0 WHERE chat_id = ?",
+                (chat_id,)
+            )
+            return True, "✅ Чат успешно отвязан от оператора!"
+
+    def get_operator_by_chat(self, chat_id):
+        """Получить оператора, к которому привязан чат"""
+        res = self.cursor.execute(
+            "SELECT operator_id FROM operator_chats WHERE chat_id = ? AND is_active = 1",
+            (chat_id,)
+        ).fetchone()
+        return res[0] if res else None
+
+    def get_operator_chats(self, operator_id):
+        """Получить все чаты оператора"""
+        return self.cursor.execute(
+            "SELECT id, chat_id, chat_title, created_at FROM operator_chats WHERE operator_id = ? AND is_active = 1 ORDER BY created_at DESC",
+            (operator_id,)
+        ).fetchall()
+
+    def get_all_bound_chats(self):
+        """Получить все привязанные чаты"""
+        return self.cursor.execute("""
+            SELECT oc.id, oc.chat_id, oc.chat_title, oc.created_at, 
+                   u.user_id, u.username, oc.is_active
+            FROM operator_chats oc
+            LEFT JOIN users u ON oc.operator_id = u.user_id
+            WHERE oc.is_active = 1
+            ORDER BY oc.created_at DESC
+        """).fetchall()
+
 # --- КОНФИГУРАЦИЯ БОТА ---
 
 TOKEN = "8168150477:AAGX0s9L3KTIBB0X-wuFke7AIVUPcXaBigU"
@@ -1187,9 +1233,10 @@ class Form(StatesGroup):
     # Состояния для скрытой надбавки времени
     waiting_for_hidden_bonus_tariff = State()
     waiting_for_hidden_bonus_minutes = State()
-    # Состояния для выбора даты
-    waiting_for_date_selection = State()  # Выбор даты для просмотра базы
-    waiting_for_download_date = State()   # Выбор даты для скачивания базы
+    # Состояния для привязки/отвязки чатов
+    waiting_for_chat_to_bind = State()
+    waiting_for_chat_to_unbind = State()
+    waiting_for_operator_for_chat = State()
 
 # --- КЛАВИАТУРЫ ---
 
@@ -1253,6 +1300,7 @@ def get_admin_keyboard(is_super_admin: bool):
         buttons.append([InlineKeyboardButton(text="🎭 Управление фейковой очередью", callback_data="admin_fake_queue")])
         buttons.append([InlineKeyboardButton(text="⭐ Настройка Приоритета", callback_data="admin_edit_priority")])
         buttons.append([InlineKeyboardButton(text="🚫 Управление банами", callback_data="admin_ban_menu")])
+        buttons.append([InlineKeyboardButton(text="💬 Управление чатами операторов", callback_data="admin_chat_management")])
         buttons.append([InlineKeyboardButton(text="📊 Сколько очереди", callback_data="admin_count_queue"),
                         InlineKeyboardButton(text="🗑 Очистить очередь", callback_data="admin_clear_queue_start")])
         buttons.append([InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")])
@@ -2349,6 +2397,30 @@ async def number_cmd(message: types.Message):
     if user_id not in ADMIN_IDS and not db.is_admin(user_id):
         await message.answer("❌ У вас нет прав доступа к этой команде.")
         return
+    
+    # Проверяем привязку чата для операторов (кроме супер-админов)
+    if user_id not in ADMIN_IDS:
+        chat_id = message.chat.id
+        operator_for_chat = db.get_operator_by_chat(chat_id)
+        
+        if operator_for_chat != user_id:
+            # Получаем информацию о чате
+            try:
+                chat_info = await bot.get_chat(chat_id)
+                chat_title = chat_info.title or "Личные сообщения"
+            except:
+                chat_title = "этот чат"
+            
+            await message.answer(
+                f"🚫 **Доступ запрещен!**\n\n"
+                f"Чат **{chat_title}** не привязан к вам.\n\n"
+                f"💡 **Что делать?**\n"
+                f"1. Перейдите в чат, который привязан к вам\n"
+                f"2. Используйте команду /mychats чтобы посмотреть свои чаты\n"
+                f"3. Обратитесь к администратору для привязки нового чата",
+                parse_mode="None"
+            )
+            return
 
     number = db.get_next_number_from_queue()
     if not number:
@@ -2489,300 +2561,49 @@ async def admin_take_fast_handler(callback: CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_base")
-async def admin_base_handler(callback: CallbackQuery, state: FSMContext):
-    """Кнопка базы номеров в админ-панели с выбором даты"""
+async def admin_base_handler(callback: CallbackQuery):
+    """Кнопка базы номеров в админ-панели"""
     user_id = callback.from_user.id
     if user_id not in ADMIN_IDS and not db.is_admin(user_id):
         await callback.answer("❌ У вас нет прав доступа", show_alert=True)
         return
     
-    # Получаем список доступных дат
-    available_dates = db.get_available_dates()
+    nums = db.get_all_numbers_limit(10)
+    text = "📂 **Последние 10 номеров:**\n\n"
+    for n in nums:
+        safe_phone = escape_markdown(n[0])
+        safe_username = escape_markdown(n[1] or '—')
+        text += f"📞 `{safe_phone}` | 👤 @{safe_username} | 📊 {n[2]} | 📦 {n[3]}\n"
     
-    text = "📂 **База номеров**\n\n"
-    text += "Выберите дату для просмотра или действие:"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 Скачать полную базу (TXT)", callback_data="csv")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel_back")]
+    ])
     
-    buttons = []
-    
-    # Кнопки для последних 5 дат
-    for i, (date_str,) in enumerate(available_dates[:5]):
-        # Форматируем дату в более читаемый вид
-        try:
-            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-            formatted_date = date_obj.strftime('%d.%m.%Y')
-            button_text = f"📅 {formatted_date}"
-        except:
-            button_text = f"📅 {date_str}"
-        
-        buttons.append([InlineKeyboardButton(
-            text=button_text, 
-            callback_data=f"view_date_{date_str}"
-        )])
-    
-    # Кнопка "Все номера"
-    buttons.append([InlineKeyboardButton(
-        text="📋 Все номера (последние 10)", 
-        callback_data="view_all_numbers"
-    )])
-    
-    # Кнопка "Скачать за дату"
-    buttons.append([InlineKeyboardButton(
-        text="📥 Скачать за дату", 
-        callback_data="download_by_date"
-    )])
-    
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel_back")])
-    
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="None")
 
-@dp.callback_query(F.data == "view_all_numbers")
-async def view_all_numbers_handler(callback: CallbackQuery):
-    """Показать все номера (без фильтрации по дате)"""
+@dp.callback_query(F.data == "csv")
+async def csv_handler(callback: CallbackQuery):
+    """Скачать базу номеров"""
     user_id = callback.from_user.id
     if user_id not in ADMIN_IDS and not db.is_admin(user_id):
         await callback.answer("❌ У вас нет прав доступа", show_alert=True)
         return
     
-    nums = db.get_numbers_by_date(limit=10)  # Без даты - последние 10
-    
-    if not nums:
-        text = "📭 **Нет номеров в базе**"
-    else:
-        text = "📂 **Последние 10 номеров:**\n\n"
-        for n in nums:
-            phone, username, status, tariff_name, created_at = n
-            safe_phone = escape_markdown(phone)
-            safe_username = escape_markdown(username or '—')
-            
-            # Форматируем дату
-            if created_at:
-                created_date = created_at.split()[0]
-                created_time = created_at.split()[1][:5]
-                date_display = f"{created_date} {created_time}"
-            else:
-                date_display = "—"
-            
-            text += f"📞 `{safe_phone}`\n👤 @{safe_username}\n📊 {status} | 📦 {tariff_name}\n🕐 {date_display}\n━━━━━━━━━━━━━━━━━━━━\n"
-    
-    buttons = [
-        [InlineKeyboardButton(text="📥 Скачать полную базу (TXT)", callback_data="csv_all")],
-        [InlineKeyboardButton(text="⬅️ Назад к выбору даты", callback_data="admin_base")]
-    ]
-    
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
-
-@dp.callback_query(F.data.startswith("view_date_"))
-async def view_date_handler(callback: CallbackQuery):
-    """Показать номера за определенную дату"""
-    user_id = callback.from_user.id
-    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
-        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
-        return
-    
-    date_str = callback.data.split("view_date_")[1]
-    
-    try:
-        # Форматируем дату для отображения
-        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-        formatted_date = date_obj.strftime('%d.%m.%Y')
-    except:
-        formatted_date = date_str
-    
-    nums = db.get_numbers_by_date(date_str, limit=20)
-    
-    if not nums:
-        text = f"📭 **Нет номеров за {formatted_date}**"
-    else:
-        # Подсчитываем статистику
-        total = len(nums)
-        status_counts = {}
-        for n in nums:
-            status = n[2]
-            status_counts[status] = status_counts.get(status, 0) + 1
-        
-        text = f"📂 **Номера за {formatted_date}**\n\n"
-        text += f"📊 **Статистика:** Всего {total} номеров\n"
-        
-        for status, count in status_counts.items():
-            text += f"  • {status}: {count}\n"
-        
-        text += "\n📋 **Последние 20 номеров:**\n\n"
-        
-        for i, n in enumerate(nums[:20], 1):
-            phone, username, status, tariff_name, created_at = n
-            safe_phone = escape_markdown(phone)
-            safe_username = escape_markdown(username or '—')
-            
-            if created_at:
-                created_time = created_at.split()[1][:5]
-                time_display = f"🕐 {created_time}"
-            else:
-                time_display = ""
-            
-            emoji = "✅" if status == "ОТСТОЯЛ" else "❌" if status == "СЛЕТ" else "⏳"
-            
-            text += f"{i}. {emoji} `{safe_phone}`\n"
-            text += f"   👤 @{safe_username} | {tariff_name} {time_display}\n"
-            
-            if i < len(nums[:20]):
-                text += "━━━━━━━━━━━━━━━━━━━━\n"
-    
-    buttons = [
-        [InlineKeyboardButton(text=f"📥 Скачать за {formatted_date}", callback_data=f"csv_date_{date_str}")],
-        [InlineKeyboardButton(text="⬅️ Назад к выбору даты", callback_data="admin_base")]
-    ]
-    
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
-
-@dp.callback_query(F.data == "download_by_date")
-async def download_by_date_handler(callback: CallbackQuery):
-    """Выбор даты для скачивания"""
-    user_id = callback.from_user.id
-    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
-        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
-        return
-    
-    # Получаем список доступных дат
-    available_dates = db.get_available_dates()
-    
-    if not available_dates:
-        await callback.answer("📭 Нет данных для скачивания", show_alert=True)
-        return
-    
-    text = "📥 **Скачать базу за дату**\n\nВыберите дату:"
-    
-    buttons = []
-    
-    # Кнопки для последних 10 дат
-    for i, (date_str,) in enumerate(available_dates[:10]):
-        try:
-            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-            formatted_date = date_obj.strftime('%d.%m.%Y')
-            button_text = f"📅 {formatted_date}"
-        except:
-            button_text = f"📅 {date_str}"
-        
-        buttons.append([InlineKeyboardButton(
-            text=button_text, 
-            callback_data=f"download_date_{date_str}"
-        )])
-    
-    buttons.append([InlineKeyboardButton(text="📥 Все номера", callback_data="csv_all")])
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_base")])
-    
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
-
-@dp.callback_query(F.data == "csv_all")
-async def csv_all_handler(callback: CallbackQuery):
-    """Скачать полную базу (все номера)"""
-    user_id = callback.from_user.id
-    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
-        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
-        return
-    
-    await csv_handler_general(callback, date_str=None)
-
-@dp.callback_query(F.data.startswith("csv_date_"))
-async def csv_date_handler(callback: CallbackQuery):
-    """Скачать базу за определенную дату"""
-    user_id = callback.from_user.id
-    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
-        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
-        return
-    
-    date_str = callback.data.split("csv_date_")[1]
-    await csv_handler_general(callback, date_str)
-
-@dp.callback_query(F.data.startswith("download_date_"))
-async def download_date_handler(callback: CallbackQuery):
-    """Скачать базу за определенную дату (из меню выбора даты)"""
-    user_id = callback.from_user.id
-    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
-        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
-        return
-    
-    date_str = callback.data.split("download_date_")[1]
-    await csv_handler_general(callback, date_str)
-
-async def csv_handler_general(callback: CallbackQuery, date_str=None):
-    """Общий обработчик для скачивания базы (с фильтром по дате или без)"""
-    user_id = callback.from_user.id
-    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
-        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
-        return
-    
-    # Получаем данные в зависимости от фильтра
-    if date_str:
-        data = db.get_all_numbers_by_date_raw(date_str)
-        try:
-            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-            formatted_date = date_obj.strftime('%d.%m.%Y')
-            file_date = date_obj.strftime('%Y-%m-%d')
-        except:
-            formatted_date = date_str
-            file_date = date_str
-        
-        filename = f"base_{file_date}.txt"
-        caption = f"📂 **База номеров за {formatted_date}**\n\n📊 Всего номеров: {len(data)}"
-    else:
-        data = db.get_all_numbers_raw()
-        today = datetime.now().strftime('%Y-%m-%d')
-        filename = f"base_all_{today}.txt"
-        caption = f"📂 **Полная база номеров**\n\n📊 Всего номеров: {len(data)}"
-    
-    if not data:
-        await callback.answer("📭 Нет данных для экспорта", show_alert=True)
-        return
-    
-    path = filename
+    data = db.get_all_numbers_raw()
+    path = "base.txt"
     with open(path, "w", encoding="utf-8") as f:
-        f.write("=" * 80 + "\n")
-        
-        if date_str:
-            f.write(f"БАЗА НОМЕРОВ ЗА {formatted_date}\n")
-        else:
-            f.write("ПОЛНАЯ БАЗА НОМЕРОВ\n")
-        
-        f.write(f"Дата экспорта: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Всего записей: {len(data)}\n")
-        f.write("=" * 80 + "\n\n")
-        
-        f.write(f"{'ID':<6} {'Номер':<15} {'Пользователь':<25} {'Статус':<12} {'Тариф':<15} {'Создан':<20} {'Завершен':<20}\n")
-        f.write("-" * 120 + "\n")
-        
-        for row in data:
-            # row содержит: id, phone, username, status, tariff_name, created_at, finished_at
-            row_id, phone, username, status, tariff_name, created_at, finished_at = row
-            
-            # Обрезаем длинные имена пользователей
-            username_display = username or "—"
-            if len(username_display) > 20:
-                username_display = username_display[:17] + "..."
-            
-            # Форматируем даты
-            created_display = created_at if created_at else "—"
-            finished_display = finished_at if finished_at else "—"
-            
-            f.write(f"{row_id:<6} {phone:<15} @{username_display:<24} {status:<12} {tariff_name:<15} {created_display:<20} {finished_display:<20}\n")
+        f.write("ID | Номер | Пользователь | Статус | Тариф | Создан | Завершен\n" + "-"*50 + "\n")
+        for row in data: 
+            f.write(" | ".join(map(str, row)) + "\n")
     
     try:
-        await callback.message.answer_document(
-            FSInputFile(path), 
-            caption=caption,
-            parse_mode="None"
-        )
-        await callback.answer("✅ Файл отправлен")
+        await callback.message.answer_document(FSInputFile(path), caption="📂 База номеров (TXT)")
     except Exception as e:
         await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
     
     if os.path.exists(path): 
         os.remove(path)
-
-# Модифицируйте существующий обработчик csv, чтобы он использовал общую логику
-@dp.callback_query(F.data == "csv")
-async def csv_handler(callback: CallbackQuery):
-    """Скачать базу номеров (старый вариант - теперь скачивает все)"""
-    await csv_all_handler(callback)
 
 # ============================================
 # ОБРАБОТЧИКИ УПРАВЛЕНИЯ ТАРИФАМИ
@@ -5071,6 +4892,412 @@ async def download_users_report_handler(callback: CallbackQuery):
         # Удаляем временный файл
         if os.path.exists(filename):
             os.remove(filename)
+
+# ============================================
+# УПРАВЛЕНИЕ ЧАТАМИ ОПЕРАТОРОВ
+# ============================================
+
+# Меню управления чатами
+@dp.callback_query(F.data == "admin_chat_management")
+async def admin_chat_management_handler(callback: CallbackQuery):
+    """Меню управления чатами операторов"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    # Получаем статистику по чатам
+    all_chats = db.get_all_bound_chats()
+    
+    text = "💬 **Управление чатами операторов**\n\n"
+    text += f"📊 **Всего привязанных чатов:** {len(all_chats)}\n\n"
+    
+    if all_chats:
+        text += "📋 **Привязанные чаты:**\n"
+        for i, chat in enumerate(all_chats[:5], 1):  # Показываем первые 5
+            chat_id, chat_id_num, chat_title, created_at, operator_id, username, is_active = chat
+            safe_username = escape_markdown(username or f"ID{operator_id}")
+            created_date = created_at.split()[0] if created_at else "—"
+            text += f"{i}. **{chat_title or 'Без названия'}**\n"
+            text += f"   👤 Оператор: @{safe_username}\n"
+            text += f"   🆔 ID чата: `{chat_id_num}`\n"
+            text += f"   📅 Привязка: {created_date}\n\n"
+    
+        if len(all_chats) > 5:
+            text += f"... и еще {len(all_chats) - 5} чатов\n\n"
+    
+    text += "Выберите действие:"
+    
+    buttons = [
+        [InlineKeyboardButton(text="➕ Привязать чат", callback_data="admin_bind_chat")],
+        [InlineKeyboardButton(text="➖ Отвязать чат", callback_data="admin_unbind_chat")],
+        [InlineKeyboardButton(text="📋 Список чатов", callback_data="admin_chats_list")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel_back")]
+    ]
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Привязка чата
+@dp.callback_query(F.data == "admin_bind_chat")
+async def admin_bind_chat_handler(callback: CallbackQuery, state: FSMContext):
+    """Начать процесс привязки чата"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    await state.set_state(Form.waiting_for_chat_to_bind)
+    
+    await callback.message.edit_text(
+        "➕ **Привязка чата к оператору**\n\n"
+        "Шаг 1 из 2\n\n"
+        "Отправьте мне ID чата, который нужно привязать:\n\n"
+        "💡 **Как получить ID чата?**\n"
+        "1. Добавьте меня в нужный чат\n"
+        "2. Отправьте в чат команду /chatid\n"
+        "3. Я пришлю ID чата\n\n"
+        "Или просто отправьте сюда ID чата (число):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_chat_management")]
+        ]),
+        parse_mode="None"
+    )
+
+# Обработка ID чата для привязки
+@dp.message(Form.waiting_for_chat_to_bind)
+async def process_chat_to_bind(message: types.Message, state: FSMContext):
+    """Обработка ID чата для привязки"""
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ У вас нет прав доступа")
+        await state.clear()
+        return
+    
+    if not message.text.isdigit():
+        await message.answer("❌ ID чата должен быть числом!")
+        return
+    
+    chat_id = int(message.text)
+    
+    # Проверяем, привязан ли уже этот чат
+    existing_operator = db.get_operator_by_chat(chat_id)
+    if existing_operator:
+        await message.answer(f"❌ Этот чат уже привязан к оператору (ID: {existing_operator})!")
+        await state.clear()
+        return
+    
+    # Сохраняем ID чата и переходим к выбору оператора
+    await state.update_data(chat_id_to_bind=chat_id)
+    await state.set_state(Form.waiting_for_operator_for_chat)
+    
+    # Получаем список операторов
+    admins = db.get_admins_list()
+    
+    if not admins:
+        await message.answer("❌ Нет доступных операторов для привязки!")
+        await state.clear()
+        return
+    
+    text = "👤 **Выбор оператора**\n\nШаг 2 из 2\n\nВыберите оператора для привязки чата:"
+    
+    buttons = []
+    for admin in admins:
+        admin_id, admin_username = admin
+        # Не показываем главных админов из ADMIN_IDS
+        if admin_id not in ADMIN_IDS:
+            button_text = f"@{admin_username or f'ID{admin_id}'}"
+            buttons.append([InlineKeyboardButton(
+                text=button_text, 
+                callback_data=f"bind_operator_{admin_id}"
+            )])
+    
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_chat_management")])
+    
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Обработка выбора оператора для привязки
+@dp.callback_query(F.data.startswith("bind_operator_"))
+async def bind_operator_handler(callback: CallbackQuery, state: FSMContext):
+    """Привязка чата к выбранному оператору"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    operator_id = int(callback.data.split("_")[2])
+    
+    # Получаем данные из состояния
+    data = await state.get_data()
+    chat_id = data.get('chat_id_to_bind')
+    
+    if not chat_id:
+        await callback.answer("❌ Ошибка: не найден ID чата", show_alert=True)
+        await state.clear()
+        return
+    
+    try:
+        # Получаем информацию о чате
+        chat = await bot.get_chat(chat_id)
+        chat_title = chat.title or "Без названия"
+    except Exception as e:
+        chat_title = "Неизвестный чат"
+    
+    # Привязываем чат
+    success, message_text = db.bind_chat_to_operator(operator_id, chat_id, chat_title)
+    
+    if success:
+        # Уведомляем оператора
+        try:
+            await bot.send_message(
+                operator_id,
+                f"💬 **Вам привязан новый чат!**\n\n"
+                f"📝 **Название:** {chat_title}\n"
+                f"🆔 **ID чата:** `{chat_id}`\n\n"
+                f"Теперь этот чат закреплен за вами.",
+                parse_mode="None"
+            )
+        except:
+            pass
+        
+        await callback.message.edit_text(
+            f"✅ **Чат успешно привязан!**\n\n"
+            f"📝 **Чат:** {chat_title}\n"
+            f"🆔 **ID чата:** `{chat_id}`\n"
+            f"👤 **Оператор:** ID {operator_id}\n\n"
+            f"Оператор уведомлен о привязке.",
+            parse_mode="None"
+        )
+    else:
+        await callback.message.edit_text(
+            f"❌ **Ошибка привязки!**\n\n{message_text}",
+            parse_mode="None"
+        )
+    
+    await state.clear()
+
+# Отвязка чата
+@dp.callback_query(F.data == "admin_unbind_chat")
+async def admin_unbind_chat_handler(callback: CallbackQuery, state: FSMContext):
+    """Начать процесс отвязки чата"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    await state.set_state(Form.waiting_for_chat_to_unbind)
+    
+    await callback.message.edit_text(
+        "➖ **Отвязка чата от оператора**\n\n"
+        "Отправьте мне ID чата, который нужно отвязать:\n\n"
+        "💡 **Как найти ID чата?**\n"
+        "1. Зайдите в меню 'Список чатов'\n"
+        "2. Посмотрите ID нужного чата\n"
+        "3. Отправьте его сюда\n\n"
+        "Или просто отправьте сюда ID чата (число):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_chat_management")]
+        ]),
+        parse_mode="None"
+    )
+
+# Обработка отвязки чата
+@dp.message(Form.waiting_for_chat_to_unbind)
+async def process_chat_to_unbind(message: types.Message, state: FSMContext):
+    """Обработка отвязки чата"""
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ У вас нет прав доступа")
+        await state.clear()
+        return
+    
+    if not message.text.isdigit():
+        await message.answer("❌ ID чата должен быть числом!")
+        return
+    
+    chat_id = int(message.text)
+    
+    # Отвязываем чат
+    success, message_text = db.unbind_chat_from_operator(chat_id)
+    
+    if success:
+        # Получаем информацию о чате для уведомления оператора
+        chat_info = db.cursor.execute(
+            "SELECT operator_id, chat_title FROM operator_chats WHERE chat_id = ?",
+            (chat_id,)
+        ).fetchone()
+        
+        if chat_info:
+            operator_id, chat_title = chat_info
+            # Уведомляем оператора
+            try:
+                await bot.send_message(
+                    operator_id,
+                    f"💬 **Чат отвязан от вас!**\n\n"
+                    f"📝 **Чат:** {chat_title or 'Без названия'}\n"
+                    f"🆔 **ID чата:** `{chat_id}`\n\n"
+                    f"Этот чат больше не закреплен за вами.",
+                    parse_mode="None"
+                )
+            except:
+                pass
+        
+        await message.answer(
+            f"✅ **Чат успешно отвязан!**\n\n"
+            f"🆔 **ID чата:** `{chat_id}`\n\n"
+            f"Чат больше не привязан ни к одному оператору.",
+            parse_mode="None"
+        )
+    else:
+        await message.answer(f"❌ {message_text}", parse_mode="None")
+    
+    await state.clear()
+
+# Список чатов
+@dp.callback_query(F.data == "admin_chats_list")
+async def admin_chats_list_handler(callback: CallbackQuery):
+    """Список привязанных чатов"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    all_chats = db.get_all_bound_chats()
+    
+    if not all_chats:
+        text = "📋 **Нет привязанных чатов**\n\nВсе чаты свободны."
+    else:
+        text = "📋 **Список привязанных чатов**\n\n"
+        
+        for i, chat in enumerate(all_chats, 1):
+            chat_id, chat_id_num, chat_title, created_at, operator_id, username, is_active = chat
+            safe_username = escape_markdown(username or f"ID{operator_id}")
+            created_date = created_at.split()[0] if created_at else "—"
+            
+            text += f"{i}. **{chat_title or 'Без названия'}**\n"
+            text += f"   👤 **Оператор:** @{safe_username}\n"
+            text += f"   🆔 **ID чата:** `{chat_id_num}`\n"
+            text += f"   📅 **Привязка:** {created_date}\n"
+            text += f"   🔗 **Статус:** {'✅ Активен' if is_active else '❌ Неактивен'}\n\n"
+    
+    buttons = [
+        [InlineKeyboardButton(text="📥 Скачать отчет", callback_data="download_chats_report")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_chat_management")]
+    ]
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+# Скачать отчет по чатам
+@dp.callback_query(F.data == "download_chats_report")
+async def download_chats_report_handler(callback: CallbackQuery):
+    """Скачать отчет по привязанным чатам"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    all_chats = db.get_all_bound_chats()
+    
+    if not all_chats:
+        await callback.answer("📭 Нет данных для отчета", show_alert=True)
+        return
+    
+    # Создаем файл
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"chats_report_{timestamp}.txt"
+    
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write("=" * 80 + "\n")
+        f.write("ОТЧЕТ ПО ПРИВЯЗАННЫМ ЧАТАМ\n")
+        f.write(f"Дата экспорта: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Всего привязанных чатов: {len(all_chats)}\n")
+        f.write("=" * 80 + "\n\n")
+        
+        f.write("ДЕТАЛИ ПО ЧАТАМ:\n\n")
+        f.write(f"{'№':<3} {'Название':<30} {'ID чата':<15} {'Оператор':<25} {'Дата привязки':<15}\n")
+        f.write("-" * 90 + "\n")
+        
+        for i, chat in enumerate(all_chats, 1):
+            chat_id, chat_id_num, chat_title, created_at, operator_id, username, is_active = chat
+            username_display = username or f"ID{operator_id}"
+            
+            if len(chat_title or "") > 25:
+                chat_title_short = (chat_title[:22] + "...") if chat_title else "Без названия"
+            else:
+                chat_title_short = chat_title or "Без названия"
+            
+            if len(username_display) > 20:
+                username_display = username_display[:17] + "..."
+            
+            created_date = created_at.split()[0] if created_at else "—"
+            
+            f.write(f"{i:<3} {chat_title_short:<30} {chat_id_num:<15} @{username_display:<24} {created_date:<15}\n")
+    
+    try:
+        # Отправляем файл
+        await callback.message.answer_document(
+            FSInputFile(filename),
+            caption=f"📋 **Отчет по привязанным чатам**\n\n"
+                   f"📅 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+                   f"💬 Всего чатов: {len(all_chats)}",
+            parse_mode="None"
+        )
+        await callback.answer("✅ Файл отправлен")
+    except Exception as e:
+        await callback.answer(f"❌ Ошибка отправки файла: {e}", show_alert=True)
+    finally:
+        # Удаляем временный файл
+        if os.path.exists(filename):
+            os.remove(filename)
+
+# Команда для получения ID чата
+@dp.message(Command("chatid"))
+async def chatid_cmd(message: types.Message):
+    """Получить ID текущего чата"""
+    chat_id = message.chat.id
+    chat_title = message.chat.title or "Личные сообщения"
+    
+    text = (
+        f"💬 **Информация о чате**\n\n"
+        f"📝 **Название:** {chat_title}\n"
+        f"🆔 **ID чата:** `{chat_id}`\n"
+        f"👥 **Тип чата:** {'Группа/Канал' if message.chat.type != 'private' else 'Личные сообщения'}\n\n"
+    )
+    
+    # Проверяем, привязан ли чат к оператору
+    operator_id = db.get_operator_by_chat(chat_id)
+    if operator_id:
+        operator_info = db.cursor.execute(
+            "SELECT username FROM users WHERE user_id = ?",
+            (operator_id,)
+        ).fetchone()
+        operator_name = operator_info[0] if operator_info else f"ID{operator_id}"
+        
+        text += f"🔗 **Привязан к оператору:** @{operator_name} (ID: `{operator_id}`)"
+    else:
+        text += f"🔓 **Статус:** Не привязан к оператору"
+    
+    await message.answer(text, parse_mode="None")
+
+# Команда для операторов чтобы посмотреть свои чаты
+@dp.message(Command("mychats"))
+async def mychats_cmd(message: types.Message):
+    """Показать чаты оператора"""
+    user_id = message.from_user.id
+    
+    # Проверяем, является ли оператором
+    if not db.is_admin(user_id) and user_id not in ADMIN_IDS:
+        await message.answer("❌ У вас нет прав доступа к этой команде.")
+        return
+    
+    # Получаем чаты оператора
+    chats = db.get_operator_chats(user_id)
+    
+    if not chats:
+        text = "📋 **У вас нет привязанных чатов**\n\nОбратитесь к администратору для привязки чатов."
+    else:
+        text = f"📋 **Ваши привязанные чаты** ({len(chats)} шт.)\n\n"
+        
+        for i, chat in enumerate(chats, 1):
+            chat_id, chat_id_num, chat_title, created_at = chat
+            created_date = created_at.split()[0] if created_at else "—"
+            
+            text += f"{i}. **{chat_title or 'Без названия'}**\n"
+            text += f"   🆔 ID: `{chat_id_num}`\n"
+            text += f"   📅 Привязан: {created_date}\n\n"
+    
+    await message.answer(text, parse_mode="None")
 
 # ============================================
 # ЗАПУСК БОТА
