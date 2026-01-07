@@ -2,6 +2,7 @@ import asyncio
 import logging
 import csv
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, types
@@ -923,16 +924,44 @@ class Database:
                 (new_name, new_price, new_duration, tariff_id)
             )
 
-    def add_number(self, user_id, phone, tariff_id, is_priority=0):
+    def has_user_active_number(self, user_id):
+        """Проверить, есть ли у пользователя активный номер в очереди"""
         with self.connection:
+            result = self.cursor.execute(
+                "SELECT COUNT(*) FROM numbers WHERE user_id = ? AND status = 'Ожидание'",
+                (user_id,)
+            ).fetchone()
+            return result[0] > 0 if result else False
+
+    def add_number(self, user_id, phone, tariff_id, is_priority=0):
+        """Добавить номер с проверкой на активный номер в очереди"""
+        with self.connection:
+            # Проверяем, есть ли у пользователя уже активный номер в очереди
+            if self.has_user_active_number(user_id):
+                return False, "❌ У вас уже есть номер в очереди. Дождитесь его обработки перед сдачей нового."
+            
+            # Проверяем, не был ли этот номер уже сдан (в любой статус)
+            existing_number = self.cursor.execute(
+                "SELECT COUNT(*) FROM numbers WHERE phone = ? AND user_id = ?",
+                (phone, user_id)
+            ).fetchone()
+            
+            if existing_number and existing_number[0] > 0:
+                return False, "❌ Вы уже сдавали этот номер ранее."
+            
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             # Преобразуем tariff_id в int
             tariff_id_int = int(tariff_id) if tariff_id else 0
-            self.cursor.execute(
-                "INSERT INTO numbers (user_id, phone, tariff_id, status, is_priority, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, phone, tariff_id_int, 'Ожидание', is_priority, now)
-            )
-            self.cursor.execute("UPDATE users SET total_numbers = total_numbers + 1 WHERE user_id = ?", (user_id,))
+            
+            try:
+                self.cursor.execute(
+                    "INSERT INTO numbers (user_id, phone, tariff_id, status, is_priority, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (user_id, phone, tariff_id_int, 'Ожидание', is_priority, now)
+                )
+                self.cursor.execute("UPDATE users SET total_numbers = total_numbers + 1 WHERE user_id = ?", (user_id,))
+                return True, "✅ Номер успешно добавлен в очередь!"
+            except Exception as e:
+                return False, f"❌ Ошибка при добавлении номера: {str(e)}"
 
     def clear_all_queue(self):
         with self.connection:
@@ -971,7 +1000,7 @@ class Database:
     def get_user_archive(self, user_id):
         """Получить архив номеров пользователя (только СЛЕТ или ОТСТОЯЛ без времени)"""
         return self.cursor.execute("""
-            SELECT n.phone, n.status, t.name
+            SELECT n.phone, n.status, t.name  # Убрали n.finished_at из SELECT
             FROM numbers n
             LEFT JOIN tariffs t ON n.tariff_id = t.id
             WHERE n.user_id = ? AND (n.status = 'ОТСТОЯЛ' OR n.status = 'СЛЕТ')
@@ -1353,9 +1382,9 @@ async def archive_cmd(message: types.Message):
     else:
         text = "📂 **История номеров** (последние 15):\n\n"
         for i in data:
-            # i[0] = phone, i[1] = status, i[2] = tariff name
             emo = "✅" if i[1] == "ОТСТОЯЛ" else "❌"
-            text += f"{emo} `{i[0]}` | {i[2]} | {i[1]}\n"
+            # Теперь используем только i[0] (телефон), i[1] (статус), i[2] (название тарифа)
+            text += f"{emo} `{i[0]}` | {i[2]} | {i[1]}\n"  # Убрано время
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
@@ -1376,9 +1405,9 @@ async def archive_button_handler(callback: CallbackQuery):
     else:
         text = "📂 **История номеров** (последние 15):\n\n"
         for i in data:
-            # i[0] = phone, i[1] = status, i[2] = tariff name
             emo = "✅" if i[1] == "ОТСТОЯЛ" else "❌"
-            text += f"{emo} `{i[0]}` | {i[2]} | {i[1]}\n"
+            # Теперь используем только i[0] (телефон), i[1] (статус), i[2] (название тарифа)
+            text += f"{emo} `{i[0]}` | {i[2]} | {i[1]}\n"  # Убрано время
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
@@ -1481,6 +1510,39 @@ async def give_number_button_handler(callback: CallbackQuery):
     if db.is_user_banned(callback.from_user.id): 
         return
     
+    # Проверяем, нет ли у пользователя уже активного номера
+    if db.has_user_active_number(callback.from_user.id):
+        # Получаем информацию об активном номере
+        active_number = db.cursor.execute(
+            "SELECT phone, created_at FROM numbers WHERE user_id = ? AND status = 'Ожидание' LIMIT 1",
+            (callback.from_user.id,)
+        ).fetchone()
+        
+        if active_number:
+            phone, created_at = active_number
+            created_time = created_at.split()[1][:5] if created_at else "—"
+            
+            text = (
+                f"❌ *У вас уже есть номер в очереди!*\n\n"
+                f"📱 *Активный номер:* `{phone}`\n"
+                f"⏰ *Сдан в:* {created_time}\n\n"
+                f"⚠️ *Вы можете иметь только один номер в очереди одновременно.*\n\n"
+                f"📊 *Что делать:*\n"
+                f"1. Дождитесь обработки текущего номера оператором\n"
+                f"2. После завершения работы с номером (СЛЕТ или ОТСТОЯЛ)\n"
+                f"3. Вы сможете сдать новый номер\n\n"
+                f"📋 *Проверить статус:* /myactive"
+            )
+            
+            buttons = [
+                [InlineKeyboardButton(text="📋 Мой активный номер", callback_data="check_active_number")],
+                [InlineKeyboardButton(text="📊 Очередь", callback_data="queue")],
+                [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+            ]
+            
+            await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+            return
+    
     is_closed, closed_message = db.is_system_closed()
     if is_closed:
         await callback.message.edit_text(closed_message, reply_markup=get_main_menu(), parse_mode="None")
@@ -1501,8 +1563,11 @@ async def give_number_button_handler(callback: CallbackQuery):
     
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")])
     
-    await callback.message.edit_text("💰 **Выберите тип сдачи номера:**", 
-                                    reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.edit_text(
+        "💰 **Выберите тип сдачи номера:**\n\n"
+        "⚠️ **Ограничение:** Один номер в очереди на пользователя", 
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
 
 @dp.message(Command("tariffs"))
 async def tariffs_cmd(message: types.Message):
@@ -1586,6 +1651,7 @@ async def help_cmd(message: types.Message):
         "• /tariffs - Доступные тарифы\n"
         "• /withdraw - Вывод средств\n"
         "• /ref - Реферальная система\n"
+        "• /myactive - Проверить активный номер\n"
         "• /help - Эта справка\n\n"
         "📞 **Техподдержка:** @magic_work_official\n\n"
         "⚡ **Быстрые действия через кнопки:**\n"
@@ -1593,6 +1659,48 @@ async def help_cmd(message: types.Message):
     )
     
     await message.answer(help_text, reply_markup=get_main_menu(), parse_mode="None")
+
+@dp.message(Command("myactive"))
+async def myactive_cmd(message: types.Message):
+    """Команда для проверки активного номера в очереди"""
+    if db.is_user_banned(message.from_user.id): 
+        return
+    
+    # Проверяем, есть ли активный номер
+    active_numbers = db.cursor.execute(
+        "SELECT phone, created_at FROM numbers WHERE user_id = ? AND status = 'Ожидание' ORDER BY created_at DESC LIMIT 1",
+        (message.from_user.id,)
+    ).fetchall()
+    
+    if not active_numbers:
+        await message.answer("📭 *У вас нет активных номеров в очереди.*\n\nВы можете сдать новый номер через меню.", 
+                           reply_markup=get_main_menu(), parse_mode="None")
+        return
+    
+    phone, created_at = active_numbers[0]
+    
+    # Получаем позицию в очереди
+    user_pos = db.get_user_position(message.from_user.id)
+    
+    # Форматируем дату
+    created_time = created_at.split()[1][:5] if created_at else "—"
+    created_date = created_at.split()[0] if created_at else "—"
+    
+    text = (
+        f"📋 *Ваш активный номер в очереди*\n\n"
+        f"📱 *Номер:* `{phone}`\n"
+        f"📅 *Сдан:* {created_date} в {created_time}\n"
+        f"📍 *Позиция в очереди:* {user_pos}-й\n\n"
+        f"⏳ *Ожидайте уведомления от оператора.*\n\n"
+        f"📊 *Информация:* Вы можете иметь только один номер в очереди одновременно."
+    )
+    
+    buttons = [
+        [InlineKeyboardButton(text="📊 Проверить очередь", callback_data="queue")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+    ]
+    
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
 
 # ============================================
 # РЕФЕРАЛЬНАЯ СИСТЕМА
@@ -1710,6 +1818,51 @@ async def my_referrals_handler(callback: CallbackQuery):
     
     buttons = [
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="referral_system")]
+    ]
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+@dp.callback_query(F.data == "check_active_number")
+async def check_active_number_handler(callback: CallbackQuery):
+    """Проверить активный номер в очереди"""
+    if db.is_user_banned(callback.from_user.id): 
+        return
+    
+    # Проверяем, есть ли активный номер
+    active_numbers = db.cursor.execute(
+        "SELECT phone, created_at FROM numbers WHERE user_id = ? AND status = 'Ожидание' ORDER BY created_at DESC LIMIT 1",
+        (callback.from_user.id,)
+    ).fetchall()
+    
+    if not active_numbers:
+        await callback.message.edit_text(
+            "📭 *У вас нет активных номеров в очереди.*\n\nВы можете сдать новый номер через меню.", 
+            reply_markup=get_main_menu(), 
+            parse_mode="None"
+        )
+        return
+    
+    phone, created_at = active_numbers[0]
+    
+    # Получаем позицию в очереди
+    user_pos = db.get_user_position(callback.from_user.id)
+    
+    # Форматируем дату
+    created_time = created_at.split()[1][:5] if created_at else "—"
+    created_date = created_at.split()[0] if created_at else "—"
+    
+    text = (
+        f"📋 *Ваш активный номер в очереди*\n\n"
+        f"📱 *Номер:* `{phone}`\n"
+        f"📅 *Сдан:* {created_date} в {created_time}\n"
+        f"📍 *Позиция в очереди:* {user_pos}-й\n\n"
+        f"⏳ *Ожидайте уведомления от оператора.*\n\n"
+        f"📊 *Информация:* Вы можете иметь только один номер в очереди одновременно."
+    )
+    
+    buttons = [
+        [InlineKeyboardButton(text="📊 Проверить очередь", callback_data="queue")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
     ]
     
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
@@ -3838,14 +3991,6 @@ async def number_input_handler(message: types.Message, state: FSMContext):
     phone = message.text.strip()
     
     # Проверка формата номера Казахстана
-    import re
-    
-    # Форматы номеров Казахстана:
-    # +7XXXXXXXXXX (11 цифр с кодом +7)
-    # 8XXXXXXXXXX (11 цифр с кодом 8)
-    # 7XXXXXXXXXX (11 цифр с кодом 7)
-    # Также поддерживаем форматы с разделителями: +7 XXX XXX XXXX, 8 XXX XXX XXXX и т.д.
-    
     # Убираем все нецифровые символы
     digits_only = re.sub(r'\D', '', phone)
     
@@ -3853,40 +3998,58 @@ async def number_input_handler(message: types.Message, state: FSMContext):
     if len(digits_only) == 11:
         # Проверяем код страны/оператора
         if digits_only.startswith('77') or digits_only.startswith('87') or digits_only.startswith('76') or digits_only.startswith('70'):
-            # Номер начинается с кодов Казахстана
             data = await state.get_data()
-            db.add_number(message.from_user.id, phone, data['tariff_id'], data['is_priority'])
             
-            _, p_name = db.get_priority_settings()
-            text = "✅ *Номер добавлен в очередь!*"
-            if data['is_priority']:
-                text = f"⭐ *{p_name} номер добавлен в начало очереди!*"
+            # Добавляем номер с проверкой
+            success, result_message = db.add_number(message.from_user.id, phone, data['tariff_id'], data['is_priority'])
             
-            # Показываем нормализованный номер для информации
-            normalized_number = f"+7{digits_only[1:]}"  # Преобразуем в международный формат
-            await message.answer(
-                f"{text}\n\n"
-                f"📱 *Номер:* {normalized_number}\n"
-                f"🇰🇿 *Страна:* Казахстан",
-                reply_markup=get_main_menu(),
-                parse_mode="None"
-            )
+            if success:
+                _, p_name = db.get_priority_settings()
+                text = "✅ *Номер добавлен в очередь!*"
+                if data['is_priority']:
+                    text = f"⭐ *{p_name} номер добавлен в начало очереди!*"
+                
+                # Показываем нормализованный номер для информации
+                normalized_number = f"+7{digits_only[1:]}"  # Преобразуем в международный формат
+                await message.answer(
+                    f"{text}\n\n"
+                    f"📱 *Номер:* {normalized_number}\n"
+                    f"🇰🇿 *Страна:* Казахстан",
+                    reply_markup=get_main_menu(),
+                    parse_mode="None"
+                )
+                
+                # Уведомление админов
+                for admin_id in ADMIN_IDS:
+                    try:
+                        alert = f"🔔 *СРОЧНО: {p_name}!\n" if data['is_priority'] else "🔔 **Новый номер!*\n"
+                        safe_phone = escape_markdown(phone)
+                        await bot.send_message(admin_id, f"{alert}📞 {safe_phone}\n🇰🇿 Казахстан\nНажмите /number", parse_mode="None")
+                    except: 
+                        pass
+            else:
+                # Если не удалось добавить номер (уже есть активный или дубликат)
+                await message.answer(result_message, reply_markup=get_main_menu(), parse_mode="None")
             
-            # Уведомление админов
-            for admin_id in ADMIN_IDS:
-                try:
-                    alert = f"🔔 *СРОЧНО: {p_name}!\n" if data['is_priority'] else "🔔 **Новый номер!*\n"
-                    safe_phone = escape_markdown(phone)
-                    await bot.send_message(admin_id, f"{alert}📞 {safe_phone}\n🇰🇿 Казахстан\nНажмите /number", parse_mode="None")
-                except: 
-                    pass
             await state.clear()
             return
+        else:
+            await message.answer("❌ *Неверный код оператора!*\n\n🇰🇿 Только номера Казахстана с кодами: 77, 87, 76, 70 и другие", parse_mode="None")
+            return
+    else:
+        await message.answer("❌ *Неверная длина номера!*\n\n📱 Номер должен содержать 11 цифр\nПример: +77012345678 или 87012345678", parse_mode="None")
+        return
 
 @dp.callback_query(F.data.startswith("tariff_"))
 async def tariff_select_handler(callback: CallbackQuery, state: FSMContext):
     """Выбор тарифа для сдачи номера"""
     if db.is_user_banned(callback.from_user.id): 
+        return
+    
+    # Проверяем, нет ли у пользователя уже активного номера
+    if db.has_user_active_number(callback.from_user.id):
+        await callback.answer("❌ У вас уже есть номер в очереди. Дождитесь его обработки.", show_alert=True)
+        await back_to_main_handler(callback)
         return
     
     is_closed, closed_message = db.is_system_closed()
@@ -3897,6 +4060,8 @@ async def tariff_select_handler(callback: CallbackQuery, state: FSMContext):
     data = callback.data.split("_")
     await state.update_data(tariff_id=data[1], is_priority=int(data[2]))
     await state.set_state(Form.waiting_for_number)
+    
+    # Добавляем информацию об ограничении в сообщение
     await callback.message.edit_text(
         "✏️ *Введите номер телефона Казахстана*\n\n"
         "📱 *Форматы:*\n"
@@ -3904,29 +4069,10 @@ async def tariff_select_handler(callback: CallbackQuery, state: FSMContext):
         "• 8XXXXXXXXXX (пример: 87012345678)\n"
         "• 7XXXXXXXXXX (пример: 77012345678)\n\n"
         "🇰🇿 *Только номера Казахстана!*\n"
-        "Коды операторов: 77, 87, 76, 70 и другие"
+        "Коды операторов: 77, 87, 76, 70 и другие\n\n"
+        "⚠️ *Ограничение:* Один номер в очереди на пользователя"
     )
-    
-    phone = message.text.strip()
-    data = await state.get_data()
-    db.add_number(message.from_user.id, phone, data['tariff_id'], data['is_priority'])
-    
-    _, p_name = db.get_priority_settings()
-    text = "✅ **Номер добавлен в очередь!**"
-    if data['is_priority']:
-        text = f"⭐ **{p_name} номер добавлен в начало очереди!**"
-        
-    await message.answer(text, reply_markup=get_main_menu(), parse_mode="None")
-    
-    # Уведомление админов
-    for admin_id in ADMIN_IDS:
-        try:
-            alert = f"🔔 **СРОЧНО: {p_name}!**\n" if data['is_priority'] else "🔔 **Новый номер!**\n"
-            safe_phone = escape_markdown(phone)
-            await bot.send_message(admin_id, f"{alert}📞 `{safe_phone}`\nНажмите /number", parse_mode="None")
-        except: 
-            pass
-    await state.clear()
+    await callback.answer()
 
 # ============================================
 # ОБРАБОТЧИКИ СОСТОЯНИЙ (FSM)
