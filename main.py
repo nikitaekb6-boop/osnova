@@ -971,7 +971,7 @@ class Database:
     def get_user_archive(self, user_id):
         """Получить архив номеров пользователя (только СЛЕТ или ОТСТОЯЛ без времени)"""
         return self.cursor.execute("""
-            SELECT n.phone, n.status, n.finished_at, t.name
+            SELECT n.phone, n.status, t.name  # Убрали n.finished_at из SELECT
             FROM numbers n
             LEFT JOIN tariffs t ON n.tariff_id = t.id
             WHERE n.user_id = ? AND (n.status = 'ОТСТОЯЛ' OR n.status = 'СЛЕТ')
@@ -1342,7 +1342,7 @@ async def withdraw_cmd(message: types.Message):
 
 @dp.message(Command("archive"))
 async def archive_cmd(message: types.Message):
-    """Команда /archive - показать архив номеров"""
+    """Команда /archive - показать архив номеров БЕЗ ВРЕМЕНИ"""
     if db.is_user_banned(message.from_user.id): 
         return
     
@@ -1354,8 +1354,8 @@ async def archive_cmd(message: types.Message):
         text = "📂 **История номеров** (последние 15):\n\n"
         for i in data:
             emo = "✅" if i[1] == "ОТСТОЯЛ" else "❌"
-            time_part = i[2].split()[1][:5] if i[2] else "—"
-            text += f"{emo} `{i[0]}` | {i[3]} | {i[1]} | {time_part}\n"
+            # Теперь используем только i[0] (телефон), i[1] (статус), i[2] (название тарифа)
+            text += f"{emo} `{i[0]}` | {i[2]} | {i[1]}\n"  # Убрано время
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
@@ -1365,7 +1365,7 @@ async def archive_cmd(message: types.Message):
 
 @dp.callback_query(F.data == "archive")
 async def archive_button_handler(callback: CallbackQuery):
-    """Обработчик кнопки архива"""
+    """Обработчик кнопки архива БЕЗ ВРЕМЕНИ"""
     if db.is_user_banned(callback.from_user.id): 
         return
     
@@ -1377,8 +1377,8 @@ async def archive_button_handler(callback: CallbackQuery):
         text = "📂 **История номеров** (последние 15):\n\n"
         for i in data:
             emo = "✅" if i[1] == "ОТСТОЯЛ" else "❌"
-            time_part = i[2].split()[1][:5] if i[2] else "—"
-            text += f"{emo} `{i[0]}` | {i[3]} | {i[1]} | {time_part}\n"
+            # Теперь используем только i[0] (телефон), i[1] (статус), i[2] (название тарифа)
+            text += f"{emo} `{i[0]}` | {i[2]} | {i[1]}\n"  # Убрано время
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
