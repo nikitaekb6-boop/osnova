@@ -6,7 +6,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile
@@ -1336,6 +1336,8 @@ class Form(StatesGroup):
     waiting_for_topic_to_bind = State()  # Новое: выбор темы
     waiting_for_chat_to_unbind = State()
     waiting_for_operator_for_chat = State()
+    waiting_for_chat_title = State()  # Для ручного ввода названия чата
+    waiting_for_manual_topic_id = State()  # Для ручного ввода ID темы
 
 # --- КЛАВИАТУРЫ ---
 
@@ -5035,13 +5037,13 @@ async def admin_chat_management_handler(callback: CallbackQuery):
     text += "Выберите действие:"
     
     buttons = [
-        [InlineKeyboardButton(text="➕ Привязать чат", callback_data="admin_bind_chat")],
-        [InlineKeyboardButton(text="➖ Отвязать чат", callback_data="admin_unbind_chat")],
+        [InlineKeyboardButton(text="➕ Привязать чат/тему", callback_data="admin_bind_chat")],
+        [InlineKeyboardButton(text="➖ Отвязать чат/тему", callback_data="admin_unbind_chat")],
         [InlineKeyboardButton(text="📋 Список чатов", callback_data="admin_chats_list")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel_back")]
+        [InlineKeyboardButton(text="🔙 В админ-панель", callback_data="admin_panel_back")]
     ]
     
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
 
 # Привязка чата
 @dp.callback_query(F.data == "admin_bind_chat")
@@ -5083,19 +5085,66 @@ async def process_chat_to_bind(message: types.Message, state: FSMContext):
     
     chat_id = int(message.text)
     
+    # Проверяем, привязан ли уже этот чат
+    existing_operator = db.get_operator_by_chat(chat_id)
+    if existing_operator:
+        await message.answer(
+            f"❌ Этот чат уже привязан к оператору (ID: {existing_operator})!\n\n"
+            f"Чтобы посмотреть информацию о привязке, используйте /chatid в том чате.",
+            parse_mode="Markdown"
+        )
+        await state.clear()
+        return
+    
+    # Пытаемся получить информацию о чате
+    chat_title = None
+    chat_type = "unknown"
+    
     try:
-        # Получаем информацию о чате
+        # Пробуем получить информацию о чате
         chat = await bot.get_chat(chat_id)
         chat_title = chat.title or "Без названия"
+        chat_type = chat.type
     except Exception as e:
-        await message.answer(f"❌ Не удалось получить информацию о чате: {e}")
+        # Если не удалось получить информацию, просим уточнить
+        await state.update_data(chat_id_to_bind=chat_id)
+        
+        buttons = [
+            [
+                InlineKeyboardButton(text="📌 Супергруппа/Форум", callback_data="chat_type_forum"),
+                InlineKeyboardButton(text="👥 Группа", callback_data="chat_type_group")
+            ],
+            [
+                InlineKeyboardButton(text="📢 Канал", callback_data="chat_type_channel"),
+                InlineKeyboardButton(text="🤷 Не знаю", callback_data="chat_type_unknown")
+            ],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_chat_management")]
+        ]
+        
+        await message.answer(
+            f"🆔 **Чат ID:** `{chat_id}`\n\n"
+            f"⚠️ Не удалось автоматически определить тип чата.\n"
+            f"**Ошибка:** {str(e)[:100]}...\n\n"
+            f"**Возможные причины:**\n"
+            f"1. Бот не добавлен в этот чат\n"
+            f"2. У бота нет прав на просмотр информации\n"
+            f"3. ID чата указан неверно\n\n"
+            f"📝 **Пожалуйста, укажите тип чата вручную:**",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="Markdown"
+        )
+        await state.set_state(Form.waiting_for_topic_to_bind)
         return
     
     # Сохраняем данные
-    await state.update_data(chat_id_to_bind=chat_id, chat_title=chat_title)
+    await state.update_data(
+        chat_id_to_bind=chat_id, 
+        chat_title=chat_title,
+        chat_type=chat_type
+    )
     
     # Проверяем, является ли это форумом
-    if chat.type == 'supergroup' and chat.is_forum:
+    if chat_type == 'supergroup' and getattr(chat, 'is_forum', False):
         # Если это форум, предлагаем привязать тему
         buttons = [
             [InlineKeyboardButton(text="📌 Привязать весь чат", callback_data="bind_whole_chat")],
@@ -5105,14 +5154,97 @@ async def process_chat_to_bind(message: types.Message, state: FSMContext):
         
         await state.set_state(Form.waiting_for_topic_to_bind)
         await message.answer(
-            f"📋 **Чат найден:** {chat_title}\n\n"
-            f"ℹ️ Этот чат является **форумом** с темами.\n\n"
+            f"📋 **Чат найден:** {chat_title}\n"
+            f"🆔 **ID:** `{chat_id}`\n"
+            f"📌 **Тип:** Форум с темами\n\n"
             "Выберите, что привязать:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
             parse_mode="Markdown"
         )
     else:
         # Обычный чат, сразу переходим к выбору оператора
+        await state.update_data(bind_type='chat')
+        await choose_operator_step(message, state)
+
+@dp.callback_query(Form.waiting_for_topic_to_bind, F.data.startswith("chat_type_"))
+async def handle_chat_type_selection(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора типа чата вручную"""
+    chat_type_mapping = {
+        "chat_type_forum": ("supergroup", "Форум"),
+        "chat_type_group": ("group", "Группа"),
+        "chat_type_channel": ("channel", "Канал"),
+        "chat_type_unknown": ("unknown", "Неизвестный тип")
+    }
+    
+    chat_type_key = callback.data
+    chat_type_db, chat_type_name = chat_type_mapping.get(chat_type_key, ("unknown", "Неизвестный"))
+    
+    data = await state.get_data()
+    chat_id = data.get('chat_id_to_bind')
+    current_chat_title = data.get('chat_title')
+    
+    if not chat_id:
+        await callback.answer("❌ Ошибка: не найден ID чата", show_alert=True)
+        await state.clear()
+        return
+    
+    # Запрашиваем название чата
+    await state.update_data(
+        chat_type=chat_type_db,
+        manual_chat_type=True
+    )
+    
+    await callback.message.edit_text(
+        f"🆔 **Чат ID:** `{chat_id}`\n"
+        f"📌 **Тип:** {chat_type_name}\n\n"
+        f"📝 **Введите название чата:**\n\n"
+        f"Примеры:\n"
+        f"• Поддержка клиентов\n"
+        f"• Рабочий чат операторов\n"
+        f"• Канал заявок\n"
+        f"• Форум технической поддержки",
+        parse_mode="Markdown"
+    )
+    
+    # Меняем состояние на ожидание названия чата
+    await state.set_state(Form.waiting_for_chat_title)
+
+@dp.message(StateFilter(Form.waiting_for_chat_title))
+async def process_chat_title_input(message: types.Message, state: FSMContext):
+    """Обработка ввода названия чата"""
+    chat_title = message.text.strip()
+    
+    if len(chat_title) < 2:
+        await message.answer("❌ Название чата слишком короткое! Введите корректное название:")
+        return
+    
+    data = await state.get_data()
+    chat_id = data.get('chat_id_to_bind')
+    chat_type = data.get('chat_type', 'unknown')
+    
+    await state.update_data(chat_title=chat_title)
+    
+    # Проверяем, является ли это форумом
+    if chat_type == 'supergroup':
+        # Предлагаем выбор: привязать весь чат или тему
+        buttons = [
+            [InlineKeyboardButton(text="📌 Привязать весь чат", callback_data="bind_whole_chat")],
+            [InlineKeyboardButton(text="📝 Привязать тему", callback_data="bind_specific_topic")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_chat_management")]
+        ]
+        
+        await state.set_state(Form.waiting_for_topic_to_bind)
+        await message.answer(
+            f"✅ **Информация о чате сохранена:**\n\n"
+            f"📝 **Название:** {chat_title}\n"
+            f"🆔 **ID:** `{chat_id}`\n"
+            f"📌 **Тип:** Форум (указан вручную)\n\n"
+            "Выберите, что привязать:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="Markdown"
+        )
+    else:
+        # Обычный чат, переходим к выбору оператора
         await state.update_data(bind_type='chat')
         await choose_operator_step(message, state)
 
@@ -5162,12 +5294,61 @@ async def handle_bind_type(callback: CallbackQuery, state: FSMContext):
         await state.update_data(bind_type='chat')
         await choose_operator_step(callback.message, state)
         
-    elif callback.data == "bind_specific_topic":
+    elif callback.data == "back_to_bind_type":
+        # Возвращаемся к выбору типа привязки
         data = await state.get_data()
-        chat_id = data.get('chat_id_to_bind')
+        chat_title = data.get('chat_title', 'чат')
         
+        buttons = [
+            [InlineKeyboardButton(text="📌 Привязать весь чат", callback_data="bind_whole_chat")],
+            [InlineKeyboardButton(text="📝 Привязать тему", callback_data="bind_specific_topic")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_chat_management")]
+        ]
+        
+        await callback.message.edit_text(
+            f"📋 **Чат:** {chat_title}\n\n"
+            f"ℹ️ Этот чат является **форумом** с темами.\n\n"
+            "Выберите, что привязать:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="Markdown"
+        )
+
+# Обновляем обработчик bind_specific_topic
+@dp.callback_query(Form.waiting_for_topic_to_bind, F.data == "bind_specific_topic")
+async def handle_bind_specific_topic(callback: CallbackQuery, state: FSMContext):
+    """Обработка запроса на привязку темы"""
+    data = await state.get_data()
+    chat_id = data.get('chat_id_to_bind')
+    manual_chat_type = data.get('manual_chat_type', False)
+    
+    if manual_chat_type:
+        # Если тип чата указан вручную, бот вероятно не добавлен в чат
+        # Предлагаем два варианта
+        buttons = [
+            [InlineKeyboardButton(text="🔢 Ввести ID темы вручную", callback_data="enter_topic_manual")],
+            [InlineKeyboardButton(text="🔙 Вернуться к привязке всего чата", callback_data="bind_whole_chat")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_chat_management")]
+        ]
+        
+        await callback.message.edit_text(
+            f"⚠️ **Бот не добавлен в этот чат**\n\n"
+            f"Поскольку бот не находится в чате `{chat_id}`,\n"
+            f"автоматически получить список тем невозможно.\n\n"
+            f"**Варианты действий:**\n"
+            f"1. **Добавить бота в чат** и повторить попытку\n"
+            f"2. **Ввести ID темы вручную** (если он известен)\n"
+            f"3. **Привязать весь чат** без указания темы\n\n"
+            f"💡 **Как узнать ID темы?**\n"
+            f"1. Добавьте бота в чат\n"
+            f"2. Зайдите в нужную тему\n"
+            f"3. Отправьте команду /chatid\n"
+            f"4. Бот покажет ID темы",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="Markdown"
+        )
+    else:
+        # Пытаемся получить список тем
         try:
-            # Пытаемся получить список тем
             forum_topics = await bot.get_forum_topics(chat_id)
             
             if not forum_topics.topics:
@@ -5188,39 +5369,76 @@ async def handle_bind_type(callback: CallbackQuery, state: FSMContext):
                         )
                     ])
             
-            buttons.append([InlineKeyboardButton(text="🔙 Назад к выбору", callback_data="back_to_bind_type")])
+            buttons.append([InlineKeyboardButton(text="🔢 Ввести ID вручную", callback_data="enter_topic_manual")])
+            buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_bind_type")])
             
             await callback.message.edit_text(
                 "📌 **Выбор темы для привязки**\n\n"
                 "Шаг 2 из 3\n\n"
-                "Выберите тему из списка ниже:",
+                "Выберите тему из списка ниже или введите ID вручную:",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
                 parse_mode="Markdown"
             )
             
         except Exception as e:
-            await callback.answer(f"❌ Ошибка получения тем: {e}", show_alert=True)
-            await state.update_data(bind_type='chat')
-            await choose_operator_step(callback.message, state)
+            # Если не удалось получить темы
+            buttons = [
+                [InlineKeyboardButton(text="🔢 Ввести ID темы вручную", callback_data="enter_topic_manual")],
+                [InlineKeyboardButton(text="🔙 Вернуться к привязке всего чата", callback_data="bind_whole_chat")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_chat_management")]
+            ]
             
-    elif callback.data == "back_to_bind_type":
-        # Возвращаемся к выбору типа привязки
-        data = await state.get_data()
-        chat_title = data.get('chat_title', 'чат')
-        
-        buttons = [
-            [InlineKeyboardButton(text="📌 Привязать весь чат", callback_data="bind_whole_chat")],
-            [InlineKeyboardButton(text="📝 Привязать тему", callback_data="bind_specific_topic")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_chat_management")]
-        ]
-        
-        await callback.message.edit_text(
-            f"📋 **Чат:** {chat_title}\n\n"
-            f"ℹ️ Этот чат является **форумом** с темами.\n\n"
-            "Выберите, что привязать:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-            parse_mode="Markdown"
-        )
+            await callback.message.edit_text(
+                f"⚠️ **Не удалось получить список тем**\n\n"
+                f"**Ошибка:** {str(e)[:100]}...\n\n"
+                f"**Возможные причины:**\n"
+                f"1. Бот не является администратором в чате\n"
+                f"2. У бота нет прав на управление темами\n"
+                f"3. Это не форум\n\n"
+                f"Вы можете ввести ID темы вручную:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+                parse_mode="Markdown"
+            )
+
+@dp.callback_query(Form.waiting_for_topic_to_bind, F.data == "enter_topic_manual")
+async def handle_enter_topic_manual(callback: CallbackQuery, state: FSMContext):
+    """Запрос на ручной ввод ID темы"""
+    await callback.message.edit_text(
+        "🔢 **Ввод ID темы вручную**\n\n"
+        "Пожалуйста, введите ID темы (число):\n\n"
+        "💡 **Как узнать ID темы?**\n"
+        "1. Добавьте бота в чат как администратора\n"
+        f"2. Перейдите в нужную тему\n"
+        f"3. Отправьте команду /chatid\n"
+        f"4. Скопируйте число после 'ID темы:'\n\n"
+        f"Пример ввода: `5`",
+        parse_mode="Markdown"
+    )
+    
+    await state.set_state(Form.waiting_for_manual_topic_id)
+
+@dp.message(StateFilter(Form.waiting_for_manual_topic_id))
+async def process_manual_topic_id(message: types.Message, state: FSMContext):
+    """Обработка ручного ввода ID темы"""
+    if not message.text.isdigit():
+        await message.answer("❌ ID темы должен быть числом! Введите снова:")
+        return
+    
+    topic_id = int(message.text)
+    
+    # Проверяем, чтобы ID темы был валидным
+    if topic_id <= 0:
+        await message.answer("❌ ID темы должен быть положительным числом! Введите снова:")
+        return
+    
+    # Сохраняем ID темы
+    await state.update_data(
+        bind_type='topic',
+        topic_id=topic_id,
+        manual_topic_id=True
+    )
+    
+    await choose_operator_step(message, state)
 
 # Обработчик выбора конкретной темы
 @dp.callback_query(F.data.startswith("bind_topic_"))
@@ -5250,6 +5468,7 @@ async def bind_operator_handler(callback: CallbackQuery, state: FSMContext):
     chat_title = data.get('chat_title', 'Без названия')
     bind_type = data.get('bind_type', 'chat')
     topic_id = data.get('topic_id')
+    manual_topic_id = data.get('manual_topic_id', False)
     
     if not chat_id:
         await callback.answer("❌ Ошибка: не найден ID чата", show_alert=True)
@@ -5268,43 +5487,54 @@ async def bind_operator_handler(callback: CallbackQuery, state: FSMContext):
         # Уведомляем оператора
         try:
             if bind_type == 'topic':
+                warning_note = ""
+                if data.get('manual_topic_id'):
+                    warning_note = "\n\n⚠️ **Внимание:** ID темы указан вручную. Убедитесь, что бот добавлен в этот чат и тему!"
+                
                 await bot.send_message(
                     operator_id,
                     f"💬 **Вам привязана новая тема!**\n\n"
                     f"📝 **Чат:** {chat_title}\n"
                     f"📌 **Тема:** #{topic_id}\n"
-                    f"🆔 **ID чата:** `{chat_id}`\n\n"
+                    f"🆔 **ID чата:** `{chat_id}`{warning_note}\n\n"
                     f"Теперь эта тема закреплена за вами.",
                     parse_mode="Markdown"
                 )
             else:
+                warning_note = ""
+                if data.get('manual_chat_type'):
+                    warning_note = "\n\n⚠️ **Внимание:** Чат указан вручную. Убедитесь, что бот добавлен в этот чат!"
+                
                 await bot.send_message(
                     operator_id,
                     f"💬 **Вам привязан новый чат!**\n\n"
                     f"📝 **Название:** {chat_title}\n"
-                    f"🆔 **ID чата:** `{chat_id}`\n\n"
+                    f"🆔 **ID чата:** `{chat_id}`{warning_note}\n\n"
                     f"Теперь этот чат закреплен за вами.",
                     parse_mode="Markdown"
                 )
-        except:
-            pass
+        except Exception as e:
+            # Если не удалось уведомить оператора, добавляем примечание
+            message_text += f"\n\n⚠️ Не удалось уведомить оператора: {str(e)[:100]}"
         
         if bind_type == 'topic':
+            manual_note = " (указан вручную)" if data.get('manual_topic_id') else ""
             result_text = (
                 f"✅ **Тема успешно привязана!**\n\n"
                 f"📝 **Чат:** {chat_title}\n"
-                f"📌 **Тема:** #{topic_id}\n"
+                f"📌 **Тема:** #{topic_id}{manual_note}\n"
                 f"🆔 **ID чата:** `{chat_id}`\n"
                 f"👤 **Оператор:** ID {operator_id}\n\n"
-                f"Оператор уведомлен о привязке."
+                f"{'⚠️ Оператор не уведомлен (бот заблокирован или не добавлен в чат)' if 'Не удалось уведомить' in message_text else 'Оператор уведомлен о привязке.'}"
             )
         else:
+            manual_note = " (указан вручную)" if data.get('manual_chat_type') else ""
             result_text = (
                 f"✅ **Чат успешно привязан!**\n\n"
-                f"📝 **Чат:** {chat_title}\n"
+                f"📝 **Чат:** {chat_title}{manual_note}\n"
                 f"🆔 **ID чата:** `{chat_id}`\n"
                 f"👤 **Оператор:** ID {operator_id}\n\n"
-                f"Оператор уведомлен о привязке."
+                f"{'⚠️ Оператор не уведомлен (бот заблокирован или не добавлен в чат)' if 'Не удалось уведомить' in message_text else 'Оператор уведомлен о привязке.'}"
             )
         
         await callback.message.edit_text(result_text, parse_mode="Markdown")
