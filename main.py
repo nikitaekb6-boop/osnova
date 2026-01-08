@@ -1285,6 +1285,8 @@ class Form(StatesGroup):
     # Состояния для выбора даты
     waiting_for_date_selection = State()  # Выбор даты для просмотра базы
     waiting_for_download_date = State()   # Выбор даты для скачивания базы
+    # Состояние для повторной отправки фото
+    waiting_for_repeat_reply = State()
 
 # --- КЛАВИАТУРЫ ---
 
@@ -4468,9 +4470,10 @@ async def reply_start_handler(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ У вас нет прав доступа", show_alert=True)
         return
     
-    res = db.cursor.execute("SELECT user_id, phone FROM numbers WHERE id = ?", (callback.data.split("_")[1],)).fetchone()
+    number_id = callback.data.split("_")[1]
+    res = db.cursor.execute("SELECT user_id, phone FROM numbers WHERE id = ?", (number_id,)).fetchone()
     if res:
-        await state.update_data(reply_to_user_id=res[0], reply_to_phone=res[1])
+        await state.update_data(reply_to_user_id=res[0], reply_to_phone=res[1], number_id=number_id)
         await state.set_state(Form.waiting_for_reply_text)
         await callback.message.answer(f"💬 **Ответ по номеру {res[1]}:**", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel_back")]
@@ -4479,7 +4482,7 @@ async def reply_start_handler(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.waiting_for_reply_text)
 async def reply_send_handler(message: types.Message, state: FSMContext):
-    """Отправить ответ пользователю"""
+    """Отправить ответ пользователю (с поддержкой фото)"""
     user_id = message.from_user.id
     if user_id not in ADMIN_IDS and not db.is_admin(user_id):
         await message.answer("❌ У вас нет прав доступа")
@@ -4487,13 +4490,257 @@ async def reply_send_handler(message: types.Message, state: FSMContext):
         return
     
     data = await state.get_data()
+    
     try:
         safe_phone = escape_markdown(data['reply_to_phone'])
-        await bot.send_message(data['reply_to_user_id'], f"🔔 **Ответ по номеру {safe_phone}:**", parse_mode="None")
-        await message.copy_to(data['reply_to_user_id'])
-        await message.answer("✅ Отправлено")
-    except: 
-        await message.answer("❌ Ошибка отправки")
+        user_id_to_reply = data['reply_to_user_id']
+        number_id = data.get('number_id')
+        
+        # Отправляем заголовок пользователю
+        caption = f"🔔 **Сообщение по номеру {safe_phone}:**"
+        
+        if message.photo:
+            # Если отправлено фото
+            photo = message.photo[-1]
+            
+            # Создаем callback_data для кнопки "Повтор"
+            callback_data = create_repeat_callback(number_id, user_id)
+            
+            # Создаем клавиатуру с кнопкой "Повтор"
+            repeat_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Повтор", callback_data=callback_data)]
+            ])
+            
+            # Отправляем фото пользователю с кнопкой "Повтор"
+            await bot.send_photo(
+                user_id_to_reply,
+                photo.file_id,
+                caption=caption,
+                reply_markup=repeat_kb,
+                parse_mode="None"
+            )
+            
+            await message.answer(f"✅ Фото отправлено. Пользователь может нажать 'Повтор' для запроса повторной отправки.")
+            
+        elif message.text:
+            # Если отправлен текст
+            await bot.send_message(user_id_to_reply, caption, parse_mode="None")
+            await message.copy_to(user_id_to_reply)
+            await message.answer("✅ Текст отправлен")
+        else:
+            # Если отправлен другой тип медиа
+            await bot.send_message(user_id_to_reply, caption, parse_mode="None")
+            await message.copy_to(user_id_to_reply)
+            await message.answer("✅ Медиа отправлено")
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка отправки: {str(e)}")
+    
+    await state.clear()
+
+# Вспомогательная функция для создания callback_data для кнопки повтора
+def create_repeat_callback(number_id, admin_id=None):
+    """Создать callback_data для кнопки повтора"""
+    if admin_id:
+        return f"simple_repeat_{number_id}_{admin_id}"
+    return f"simple_repeat_{number_id}"
+
+# Обработчик для кнопки "Повтор" у пользователя
+@dp.callback_query(F.data.startswith("simple_repeat_"))
+async def simple_repeat_handler(callback: CallbackQuery, state: FSMContext):
+    """Пользователь нажал кнопку 'Повтор'"""
+    user_id = callback.from_user.id
+    
+    if db.is_user_banned(user_id):
+        await callback.answer("❌ Вы забанены", show_alert=True)
+        return
+    
+    # Получаем данные из callback_data
+    parts = callback.data.split("_")
+    number_id = parts[2]
+    admin_id = parts[3] if len(parts) > 3 else None
+    
+    # Получаем информацию о номере
+    number_info = db.cursor.execute(
+        "SELECT n.phone, n.user_id, u.username FROM numbers n LEFT JOIN users u ON n.user_id = u.user_id WHERE n.id = ?",
+        (number_id,)
+    ).fetchone()
+    
+    if not number_info:
+        await callback.answer("❌ Номер не найден", show_alert=True)
+        return
+    
+    phone, number_user_id, username = number_info
+    
+    # Проверяем, принадлежит ли номер этому пользователю
+    if number_user_id != user_id:
+        await callback.answer("❌ Это не ваш номер", show_alert=True)
+        return
+    
+    # Удаляем кнопку "Повтор" у пользователя
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+    
+    await callback.answer("✅ Запрос повтора отправлен оператору", show_alert=True)
+    
+    # Получаем всех операторов для отправки уведомления
+    if admin_id:
+        # Отправляем конкретному оператору
+        admins_to_notify = [int(admin_id)]
+    else:
+        # Отправляем всем операторам
+        admins = db.get_admins_list()
+        admins_to_notify = [a[0] for a in admins] + ADMIN_IDS
+    
+    # Удаляем дубликаты
+    admins_to_notify = list(set(admins_to_notify))
+    
+    # Отправляем уведомление операторам
+    safe_phone = escape_markdown(phone)
+    safe_username = escape_markdown(username or f"ID{user_id}")
+    
+    # Создаем клавиатуру для быстрого ответа
+    quick_reply_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Отправить повтор", callback_data=f"quick_resend_{number_id}_{user_id}")]
+    ])
+    
+    sent_count = 0
+    for admin_id in admins_to_notify:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🔄 **Пользователь запросил повтор!**\n\n"
+                f"📱 Номер: `{safe_phone}`\n"
+                f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
+                f"Нажмите кнопку ниже для быстрой отправки повторного фото:",
+                reply_markup=quick_reply_kb,
+                parse_mode="None"
+            )
+            sent_count += 1
+        except:
+            pass
+    
+    # Уведомляем пользователя
+    if sent_count > 0:
+        await callback.message.answer(
+            "🔄 **Запрос на повтор отправлен операторам!**\n\n"
+            "⏳ Ожидайте повторной отправки фото в ближайшее время.",
+            parse_mode="None"
+        )
+    else:
+        await callback.message.answer(
+            "❌ **Не удалось отправить запрос операторам**\n\n"
+            "Пожалуйста, попробуйте позже.",
+            parse_mode="None"
+        )
+
+# Обработчик для быстрой повторной отправки оператором
+@dp.callback_query(F.data.startswith("quick_resend_"))
+async def quick_resend_handler(callback: CallbackQuery, state: FSMContext):
+    """Оператор нажал 'Отправить повтор'"""
+    user_id = callback.from_user.id
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
+        return
+    
+    parts = callback.data.split("_")
+    number_id = parts[2]
+    target_user_id = int(parts[3])
+    
+    # Получаем информацию о номере
+    number_info = db.cursor.execute(
+        "SELECT phone FROM numbers WHERE id = ?",
+        (number_id,)
+    ).fetchone()
+    
+    if not number_info:
+        await callback.answer("❌ Номер не найден", show_alert=True)
+        return
+    
+    phone = number_info[0]
+    safe_phone = escape_markdown(phone)
+    
+    # Спрашиваем у оператора, хочет ли он отправить то же фото или новое
+    await state.update_data(
+        repeat_number_id=number_id,
+        repeat_user_id=target_user_id,
+        repeat_phone=safe_phone
+    )
+    
+    await callback.message.edit_text(
+        f"🔄 **Повторная отправка фото**\n\n"
+        f"📱 Номер: `{safe_phone}`\n"
+        f"👤 Пользователь ID: `{target_user_id}`\n\n"
+        f"Отправьте фото для повторной отправки:",
+        parse_mode="None"
+    )
+    
+    # Устанавливаем специальное состояние для повторной отправки
+    await state.set_state(Form.waiting_for_repeat_reply)
+    await callback.answer()
+
+# Обработчик для повторной отправки фото
+@dp.message(Form.waiting_for_repeat_reply)
+async def repeat_photo_send_handler(message: types.Message, state: FSMContext):
+    """Оператор отправляет фото для повторной отправки"""
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await message.answer("❌ У вас нет прав доступа")
+        await state.clear()
+        return
+    
+    data = await state.get_data()
+    
+    if not message.photo:
+        await message.answer("❌ Пожалуйста, отправьте фото")
+        return
+    
+    photo = message.photo[-1]
+    target_user_id = data['repeat_user_id']
+    safe_phone = data['repeat_phone']
+    
+    try:
+        # Отправляем фото пользователю
+        await bot.send_photo(
+            target_user_id,
+            photo.file_id,
+            caption=f"🔄 **Повторная отправка по номеру {safe_phone}:**",
+            parse_mode="None"
+        )
+        
+        # СНОВА добавляем кнопку "Повтор" (цикл продолжается)
+        repeat_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Повтор", callback_data=f"simple_repeat_{data['repeat_number_id']}_{user_id}")]
+        ])
+        
+        await bot.send_message(
+            target_user_id,
+            "🔄 Если нужно еще раз отправить код, нажмите кнопку ниже:",
+            reply_markup=repeat_kb,
+            parse_mode="None"
+        )
+        
+        await message.answer("✅ Повторное фото отправлено пользователю")
+        
+        # Обновляем сообщение оператора
+        try:
+            await message.bot.edit_message_text(
+                f"✅ **Повтор отправлен пользователю!**\n\n"
+                f"📱 Номер: `{safe_phone}`\n"
+                f"👤 Пользователь ID: `{target_user_id}`\n"
+                f"🔄 Пользователь снова может запросить повтор",
+                chat_id=message.chat.id,
+                message_id=data.get('admin_message_id', message.message_id - 1),
+                parse_mode="None"
+            )
+        except:
+            pass
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка отправки: {str(e)}")
+    
     await state.clear()
 
 # ============================================
