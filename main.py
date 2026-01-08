@@ -29,6 +29,56 @@ def escape_markdown(text):
     
     return text
 
+# --- ФУНКЦИИ ДЛЯ ПОСТЕПЕННОГО УМЕНЬШЕНИЯ ФЕЙКОВОЙ ОЧЕРЕДИ ---
+
+def decrease_fake_queue_gradually():
+    """Постепенно уменьшить фейковую очередь"""
+    current_fake = db.get_fake_queue()
+    if current_fake > 0:
+        # Уменьшаем на 1-3 номера (случайно)
+        import random
+        decrease_amount = random.randint(1, min(3, current_fake))
+        new_value = max(0, current_fake - decrease_amount)
+        db.set_fake_queue(new_value)
+        return True, decrease_amount, new_value
+    return False, 0, current_fake
+
+def decrease_fake_queue_on_number_taken():
+    """Уменьшить фейковую очередь при взятии реального номера"""
+    current_fake = db.get_fake_queue()
+    if current_fake > 0:
+        # Получаем количество реальных номеров в очереди
+        real_count = db.get_real_queue_count()
+        
+        # Если реальных номеров меньше 3, уменьшаем фейковую очередь медленнее
+        if real_count < 3:
+            # 50% шанс уменьшить на 1
+            import random
+            if random.random() < 0.5:
+                new_value = max(0, current_fake - 1)
+                db.set_fake_queue(new_value)
+                return True, 1, new_value
+        else:
+            # Если реальных номеров много, уменьшаем быстрее
+            new_value = max(0, current_fake - 1)
+            db.set_fake_queue(new_value)
+            return True, 1, new_value
+    
+    return False, 0, current_fake
+
+def decrease_fake_queue_on_number_completion():
+    """Уменьшить фейковую очередь при завершении номера"""
+    current_fake = db.get_fake_queue()
+    if current_fake > 0:
+        # 30% шанс уменьшить на 1 при завершении номера
+        import random
+        if random.random() < 0.3:
+            new_value = max(0, current_fake - 1)
+            db.set_fake_queue(new_value)
+            return True, 1, new_value
+    
+    return False, 0, current_fake
+
 # --- КЛАСС БАЗЫ ДАННЫХ ---
 
 class Database:
@@ -1145,6 +1195,7 @@ class Database:
 
 TOKEN = "8168150477:AAGX0s9L3KTIBB0X-wuFke7AIVUPcXaBigU"
 ADMIN_IDS = [8260066747] 
+PAYMENT_LOG_CHANNEL = -1003653802196  # ID канала с выплатами
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -2441,7 +2492,7 @@ async def base_cmd(message: types.Message):
 
 @dp.callback_query(F.data == "admin_take_fast")
 async def admin_take_fast_handler(callback: CallbackQuery):
-    """Кнопка взять номер в админ-панели"""
+    """Кнопка взять номер с периодическим уменьшением фейковой очереди"""
     user_id = callback.from_user.id
     
     # Проверяем права: супер-админ или оператор
@@ -2451,7 +2502,14 @@ async def admin_take_fast_handler(callback: CallbackQuery):
 
     number = db.get_next_number_from_queue()
     if not number:
-        await callback.answer("📭 Очередь пуста", show_alert=True)
+        # Если очередь пустая, уменьшаем фейковую очередь автоматически (БЕЗ УВЕДОМЛЕНИЙ)
+        decreased, amount, new_fake = decrease_fake_queue_gradually()
+        
+        if decreased:
+            # НЕ показываем уведомление об уменьшении
+            await callback.answer("📭 Очередь пуста.", show_alert=True)
+        else:
+            await callback.answer("📭 Очередь пуста.", show_alert=True)
         return
 
     n_id, phone, u_id, username, is_prio = number
@@ -2483,6 +2541,14 @@ async def admin_take_fast_handler(callback: CallbackQuery):
     safe_username = escape_markdown(username or 'User')
     
     text = f"{prio_label}📱 **Номер:** `{safe_phone}`\n👤 От: @{safe_username} (ID: `{u_id}`)"
+    
+    # Показываем статистику очереди для админов (если нужно)
+    if user_id in ADMIN_IDS:
+        total_count = db.get_queue_count()
+        real_count = db.get_real_queue_count()
+        fake_count = db.get_fake_queue()
+        
+        text += f"\n\n📊 **Очередь:** {total_count} (реальных: {real_count}, фейковых: {fake_count})"
     
     # Отправляем новое сообщение с номером
     await callback.message.answer(text, reply_markup=kb, parse_mode="None")
@@ -3341,6 +3407,39 @@ async def process_withdrawal_comment(message: types.Message, state: FSMContext):
                         f"{f'💬 **Комментарий:** {comment}' if comment else ''}",
                         parse_mode="None"
                     )
+                    
+                    # Логирование выплаты в канал
+                    try:
+                        # Шифруем имя пользователя
+                        raw_username = username or f"ID{user_id}"
+                        if username and username.startswith("@"):
+                            # Оставляем первые 3 символа и добавляем звездочки
+                            hidden_username = f"@{username[1:4]}***" if len(username) > 4 else f"@{username[1:]}***"
+                        elif username:
+                            hidden_username = f"@{username[:3]}***" if len(username) > 3 else f"@{username}***"
+                        else:
+                            # Если юзернейма нет, скрываем часть ID
+                            user_id_str = str(user_id)
+                            hidden_username = f"ID:{user_id_str[:4]}***"
+                        
+                        # Формируем текст для канала
+                        bot_username = "Magic_team_work_bot"  # Имя бота
+                        
+                        log_text = (
+                            f"✅ **Новая выплата!**\n\n"
+                            f"👤 Воркер: {hidden_username}\n"
+                            f"💰 Сумма: **${amount:.2f}**\n"
+                            f"💳 Статус: Выплачено успешно\n\n"
+                            f"🚀 Начать зарабатывать: @{bot_username}"
+                        )
+                        
+                        kb = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="💬 Чат с отзывами", url="https://t.me/magic_team_payments")]
+                        ])
+                        
+                        await bot.send_message(PAYMENT_LOG_CHANNEL, log_text, reply_markup=kb, parse_mode="Markdown")
+                    except Exception as e:
+                        logging.error(f"Ошибка отправки в лог выплат: {e}")
                 else:  # rejected
                     await bot.send_message(
                         user_id,
@@ -4102,7 +4201,7 @@ async def remove_admin_handler(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("vstal_"))
 async def vstal_handler(callback: CallbackQuery):
-    """Номер взят в работу"""
+    """Номер взят в работу с уменьшением фейковой очереди"""
     user_id = callback.from_user.id
     if user_id not in ADMIN_IDS and not db.is_admin(user_id):
         await callback.answer("❌ У вас нет прав доступа", show_alert=True)
@@ -4128,6 +4227,9 @@ async def vstal_handler(callback: CallbackQuery):
     number_info = db.set_number_vstal(n_id)  # Теперь возвращает полную информацию
     
     if number_info:
+        # Уменьшаем фейковую очередь при взятии реального номера
+        decreased, amount, new_fake = decrease_fake_queue_on_number_taken()
+        
         phone, u_id, username, is_prio = number_info
         # Уведомляем пользователя
         try: 
@@ -4185,6 +4287,9 @@ async def slet_handler(callback: CallbackQuery):
     res = db.set_number_slet(n_id, is_admin=is_super_admin)
     
     if res:
+        # Уменьшаем фейковую очередь при завершении номера
+        decreased, amount, new_fake = decrease_fake_queue_on_number_completion()
+        
         # Проверяем, был ли начислен реферальный бонус
         if res.get('referral_bonus'):
             bonus_info = res['referral_bonus']
@@ -4643,6 +4748,39 @@ async def process_fake_queue_count(message: types.Message, state: FSMContext):
     
     await state.clear()
     await admin_fake_queue_handler(message)
+
+@dp.callback_query(F.data == "fake_queue_decrease_auto")
+async def fake_queue_decrease_auto_handler(callback: CallbackQuery):
+    """Ручное уменьшение фейковой очереди по алгоритму (упрощенное)"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Только для главного админа", show_alert=True)
+        return
+    
+    decreased, amount, new_fake = decrease_fake_queue_gradually()
+    
+    if decreased:
+        # Только краткое уведомление без деталей
+        await callback.answer("✅ Фейковая очередь уменьшена", show_alert=True)
+    else:
+        await callback.answer("ℹ️ Фейковая очередь уже равна 0", show_alert=True)
+    
+    await admin_fake_queue_handler(callback)
+
+@dp.message(Command("decrease_queue"))
+async def decrease_queue_cmd(message: types.Message):
+    """Команда для ручного уменьшения фейковой очереди (упрощенная)"""
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        await message.answer("❌ У вас нет прав доступа к этой команде.")
+        return
+    
+    decreased, amount, new_fake = decrease_fake_queue_gradually()
+    
+    if decreased:
+        # Простое сообщение без деталей
+        await message.answer("✅ Фейковая очередь уменьшена", parse_mode="None")
+    else:
+        await message.answer("ℹ️ Фейковая очередь уже равна 0", parse_mode="None")
 
 # ============================================
 # ОБРАБОТЧИКИ ДЛЯ СИСТЕМНОГО СООБЩЕНИЯ
