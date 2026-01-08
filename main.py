@@ -172,6 +172,19 @@ class Database:
                 )
             """)
             
+            # Таблица для настроек группы
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS group_settings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id TEXT UNIQUE,
+                    group_name TEXT,
+                    group_type TEXT DEFAULT 'private',
+                    bot_added_by INTEGER,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_active INTEGER DEFAULT 1
+                )
+            """)
+            
             # Инициализация настроек
             settings = [
                 ('priority_price', '0.5'),
@@ -183,7 +196,9 @@ class Database:
                 ('min_withdrawal', '1.0'),
                 ('payment_methods', 'CryptoBot'),
                 ('referral_bonus', '0.5'),  # Бонус за реферала ($)
-                ('referral_enabled', '1')   # Включена ли реферальная система
+                ('referral_enabled', '1'),   # Включена ли реферальная система
+                ('operators_group_id', ''),  # ID группы операторов
+                ('operators_group_name', '')  # Название группы операторов
             ]
             
             for key, value in settings:
@@ -305,6 +320,16 @@ class Database:
                 )
             """)
         except:
+            pass
+        
+        # Добавляем настройки группы операторов если их нет
+        try:
+            self.cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('operators_group_id', '')")
+        except: 
+            pass
+        try: 
+            self.cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('operators_group_name', '')")
+        except: 
             pass
 
     # РЕФЕРАЛЬНАЯ СИСТЕМА
@@ -1234,6 +1259,54 @@ class Database:
         """Очистить истекшие блокировки"""
         with self.connection:
             self.cursor.execute("DELETE FROM number_locks WHERE expires_at <= datetime('now')")
+    
+    # Методы для работы с группой операторов
+    def set_operators_group(self, group_id, group_name):
+        """Установить группу операторов"""
+        with self.connection:
+            self.cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('operators_group_id', ?)", (str(group_id),))
+            self.cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('operators_group_name', ?)", (str(group_name),))
+            
+            # Также сохраняем в таблице group_settings
+            self.cursor.execute("""
+                INSERT OR REPLACE INTO group_settings (group_id, group_name, bot_added_by, added_at)
+                VALUES (?, ?, ?, datetime('now'))
+            """, (str(group_id), group_name, None))
+    
+    def get_operators_group_id(self):
+        """Получить ID группы операторов"""
+        res = self.cursor.execute("SELECT value FROM settings WHERE key = 'operators_group_id'").fetchone()
+        if res and res[0]:
+            return int(res[0]) if res[0].lstrip('-').isdigit() else res[0]
+        return None
+    
+    def get_operators_group_name(self):
+        """Получить название группы операторов"""
+        res = self.cursor.execute("SELECT value FROM settings WHERE key = 'operators_group_name'").fetchone()
+        return res[0] if res and res[0] else None
+    
+    def get_operators_group_info(self):
+        """Получить полную информацию о группе"""
+        group_id = self.get_operators_group_id()
+        group_name = self.get_operators_group_name()
+        
+        if group_id and group_name:
+            return {
+                'id': group_id,
+                'name': group_name,
+                'status': '✅ Привязана'
+            }
+        return {
+            'id': None,
+            'name': None,
+            'status': '❌ Не привязана'
+        }
+    
+    def clear_operators_group(self):
+        """Отвязать группу операторов"""
+        with self.connection:
+            self.cursor.execute("UPDATE settings SET value = '' WHERE key = 'operators_group_id'")
+            self.cursor.execute("UPDATE settings SET value = '' WHERE key = 'operators_group_name'")
 
 # --- КОНФИГУРАЦИЯ БОТА ---
 
@@ -2634,6 +2707,245 @@ async def base_cmd(message: types.Message):
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel_back")]
     ]
     await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="None")
+
+# ============================================
+# ОБРАБОТЧИКИ КОМАНД ДЛЯ ГРУППЫ ОПЕРАТОРОВ
+# ============================================
+
+@dp.message(Command("setup_group"))
+async def setup_group_cmd(message: types.Message):
+    """Привязать группу операторов"""
+    user_id = message.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await message.answer("❌ Только главный администратор может привязывать группы")
+        return
+    
+    # Проверяем, отправлено ли сообщение из группы
+    if message.chat.type not in ['group', 'supergroup']:
+        await message.answer(
+            "📋 **Инструкция по привязке группы:**\n\n"
+            "1. Добавьте бота @Magic_team_work_bot в вашу приватную группу\n"
+            "2. Назначьте бота администратором группы\n"
+            "3. Отправьте команду /setup_group прямо из группы\n\n"
+            "⚠️ **ВАЖНО:** Бот должен иметь права администратора!",
+            parse_mode="None"
+        )
+        return
+    
+    group_id = message.chat.id
+    group_name = message.chat.title or f"Группа {group_id}"
+    
+    # Проверяем, является ли бот администратором
+    try:
+        chat_member = await bot.get_chat_member(group_id, bot.id)
+        if chat_member.status not in ['administrator', 'creator']:
+            await message.answer(
+                "❌ **Бот не является администратором!**\n\n"
+                "Пожалуйста, назначьте бота администратором группы и попробуйте снова.",
+                parse_mode="None"
+            )
+            return
+    except Exception as e:
+        await message.answer(
+            f"❌ **Ошибка проверки прав:** {str(e)}\n\n"
+            "Убедитесь, что бот добавлен в группу и имеет права администратора.",
+            parse_mode="None"
+        )
+        return
+    
+    # Сохраняем группу в базу
+    db.set_operators_group(group_id, group_name)
+    
+    await message.answer(
+        f"✅ **Группа успешно привязана!**\n\n"
+        f"📋 **Название:** {group_name}\n"
+        f"🆔 **ID:** `{group_id}`\n"
+        f"👤 **Привязал:** @{message.from_user.username or message.from_user.id}\n\n"
+        f"Теперь все уведомления для операторов будут приходить в эту группу.",
+        parse_mode="None"
+    )
+    
+    # Отправляем тестовое сообщение в группу
+    try:
+        await bot.send_message(
+            group_id,
+            f"👋 **Приветствую, операторы!**\n\n"
+            f"Группа `{group_name}` успешно привязана к боту.\n"
+            f"Теперь все уведомления о запросах пользователей будут приходить сюда.\n\n"
+            f"🚀 **Начинаем работу!**",
+            parse_mode="None"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка отправки тестового сообщения: {e}")
+
+@dp.message(Command("group_status"))
+async def group_status_cmd(message: types.Message):
+    """Проверить статус привязанной группы"""
+    user_id = message.from_user.id
+    
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await message.answer("❌ У вас нет прав доступа к этой команде")
+        return
+    
+    group_info = db.get_operators_group_info()
+    
+    text = f"📋 **Статус группы операторов:** {group_info['status']}\n\n"
+    
+    if group_info['id']:
+        text += f"📝 **Название:** {group_info['name']}\n"
+        text += f"🆔 **ID:** `{group_info['id']}`\n\n"
+        
+        # Проверяем права бота в группе
+        try:
+            chat_member = await bot.get_chat_member(group_info['id'], bot.id)
+            if chat_member.status in ['administrator', 'creator']:
+                text += "✅ **Бот является администратором группы**\n"
+            else:
+                text += "❌ **Бот не администратор! Нужно назначить права**\n"
+        except Exception as e:
+            text += f"⚠️ **Ошибка проверки прав:** {str(e)[:50]}...\n"
+    else:
+        text += "Группа не привязана. Используйте /setup_group для привязки.\n\n"
+        text += "📋 **Инструкция:**\n"
+        text += "1. Добавьте бота в группу\n"
+        text += "2. Назначьте администратором\n"
+        text += "3. Отправьте /setup_group из группы"
+    
+    await message.answer(text, parse_mode="None")
+
+@dp.message(Command("remove_group"))
+async def remove_group_cmd(message: types.Message):
+    """Отвязать группу операторов"""
+    user_id = message.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await message.answer("❌ Только главный администратор может отвязывать группы")
+        return
+    
+    group_info = db.get_operators_group_info()
+    
+    if not group_info['id']:
+        await message.answer("❌ Группа не привязана")
+        return
+    
+    # Подтверждение
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, отвязать", callback_data="confirm_remove_group"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_remove_group")
+        ]
+    ])
+    
+    await message.answer(
+        f"⚠️ **Подтверждение отвязки группы**\n\n"
+        f"Вы уверены, что хотите отвязать группу?\n\n"
+        f"📝 **Название:** {group_info['name']}\n"
+        f"🆔 **ID:** `{group_info['id']}`\n\n"
+        f"После отвязки уведомления перестанут приходить в группу.",
+        reply_markup=keyboard,
+        parse_mode="None"
+    )
+
+@dp.message(Command("group_link"))
+async def group_link_cmd(message: types.Message):
+    """Получить ссылку на группу операторов"""
+    user_id = message.from_user.id
+    
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await message.answer("❌ У вас нет прав доступа к этой команде")
+        return
+    
+    group_info = db.get_operators_group_info()
+    
+    if not group_info['id']:
+        await message.answer("❌ Группа не привязана")
+        return
+    
+    try:
+        # Получаем пригласительную ссылку
+        chat = await bot.get_chat(group_info['id'])
+        
+        if chat.invite_link:
+            link = chat.invite_link
+        else:
+            # Пытаемся создать ссылку
+            try:
+                chat_invite = await bot.create_chat_invite_link(
+                    group_info['id'],
+                    creates_join_request=True
+                )
+                link = chat_invite.invite_link
+            except:
+                link = None
+    except Exception as e:
+        link = None
+        logging.error(f"Ошибка получения ссылки на группу: {e}")
+    
+    text = f"📋 **Информация о группе операторов**\n\n"
+    text += f"📝 **Название:** {group_info['name']}\n"
+    text += f"🆔 **ID:** `{group_info['id']}`\n"
+    
+    if link:
+        text += f"🔗 **Ссылка:** {link}\n\n"
+        text += "✏️ **Команды для управления:**\n"
+        text += "• /group_status - статус группы\n"
+        text += "• /remove_group - отвязать группу"
+        
+        # Кнопка с ссылкой
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Перейти в группу", url=link)]
+        ])
+        
+        await message.answer(text, reply_markup=keyboard, parse_mode="None")
+    else:
+        text += "\n⚠️ **Не удалось получить ссылку**\n"
+        text += "Убедитесь, что бот имеет права на создание пригласительных ссылок."
+        await message.answer(text, parse_mode="None")
+
+@dp.callback_query(F.data == "confirm_remove_group")
+async def confirm_remove_group_handler(callback: CallbackQuery):
+    """Подтверждение отвязки группы"""
+    user_id = callback.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+    
+    group_info = db.get_operators_group_info()
+    
+    if group_info['id']:
+        # Отправляем сообщение в группу перед отвязкой
+        try:
+            await bot.send_message(
+                group_info['id'],
+                "👋 **Группа отвязана от бота**\n\n"
+                "Больше уведомления не будут приходить в эту группу.\n"
+                "Для повторной привязки используйте команду /setup_group",
+                parse_mode="None"
+            )
+        except:
+            pass
+        
+        # Отвязываем группу
+        db.clear_operators_group()
+        
+        await callback.message.edit_text(
+            f"✅ **Группа успешно отвязана!**\n\n"
+            f"📝 **Название:** {group_info['name']}\n"
+            f"🆔 **ID:** `{group_info['id']}`",
+            parse_mode="None"
+        )
+    else:
+        await callback.message.edit_text("❌ Группа не была привязана", parse_mode="None")
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "cancel_remove_group")
+async def cancel_remove_group_handler(callback: CallbackQuery):
+    """Отмена отвязки группы"""
+    await callback.message.edit_text("❌ Отвязка группы отменена", parse_mode="None")
+    await callback.answer()
 
 # ============================================
 # ОБРАБОТЧИКИ КНОПОК АДМИН-ПАНЕЛИ
@@ -4615,8 +4927,8 @@ async def reply_send_handler(message: types.Message, state: FSMContext):
             photo = message.photo[-1]
             
             # Создаем callback_data для кнопок "Повтор" и "Куар"
-            callback_photo = create_repeat_callback(number_id, user_id, qr_request=False)
-            callback_qr = create_repeat_callback(number_id, user_id, qr_request=True)
+            callback_photo = create_repeat_callback(number_id, user_id, request_type="photo")
+            callback_qr = create_repeat_callback(number_id, user_id, request_type="qr")
             
             # Создаем клавиатуру с двумя кнопками
             repeat_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -4654,16 +4966,20 @@ async def reply_send_handler(message: types.Message, state: FSMContext):
     await state.clear()
 
 # Вспомогательная функция для создания callback_data для кнопки повтора
-def create_repeat_callback(number_id, admin_id=None, qr_request=False):
-    """Создать callback_data для кнопки повтора"""
-    if qr_request:
-        if admin_id:
-            return f"repeat_qr_{number_id}_{admin_id}"
-        return f"repeat_qr_{number_id}"
+def create_repeat_callback(number_id, admin_id=None, request_type="photo"):
+    """
+    Создать callback_data для кнопки повтора
     
+    Args:
+        number_id: ID номера
+        admin_id: ID оператора (опционально)
+        request_type: тип запроса - "photo" или "qr"
+    """
+    callback_parts = ["repeat", request_type, str(number_id)]
     if admin_id:
-        return f"repeat_photo_{number_id}_{admin_id}"
-    return f"repeat_photo_{number_id}"
+        callback_parts.append(str(admin_id))
+    
+    return "_".join(callback_parts)
 
 # Обработчик для кнопки "Повтор" у пользователя
 @dp.callback_query(F.data.startswith("simple_repeat_"))
@@ -4682,9 +4998,10 @@ async def simple_repeat_handler(callback: CallbackQuery, state: FSMContext):
         return
     
     try:
+        # parts[0] = "repeat", parts[1] = "photo", parts[2] = number_id, parts[3] = admin_id (опционально)
         number_id = int(parts[2])
         admin_id = int(parts[3]) if len(parts) > 3 else None
-    except ValueError:
+    except (ValueError, IndexError):
         await callback.answer("❌ Ошибка формата данных", show_alert=True)
         return
     
@@ -4926,6 +5243,119 @@ async def cancel_resend_handler(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("❌ Отправка отменена")
     await callback.answer()
 
+@dp.callback_query(F.data.startswith("send_photo_"))
+async def send_photo_handler(callback: CallbackQuery, state: FSMContext):
+    """Оператор нажал 'Отправить фото'"""
+    user_id = callback.from_user.id
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
+        return
+    
+    # Формат: send_photo_{number_id}_{target_user_id}
+    parts = callback.data.split("_")
+    
+    if len(parts) < 4:
+        await callback.answer("❌ Ошибка данных", show_alert=True)
+        return
+    
+    try:
+        number_id = int(parts[2])
+        target_user_id = int(parts[3])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Ошибка формата данных", show_alert=True)
+        return
+    
+    # Получаем информацию о номере
+    number_info = db.cursor.execute(
+        "SELECT phone FROM numbers WHERE id = ?",
+        (number_id,)
+    ).fetchone()
+    
+    if not number_info:
+        await callback.answer("❌ Номер не найден", show_alert=True)
+        return
+    
+    phone = number_info[0]
+    
+    # Запрашиваем фото у оператора
+    await state.update_data(
+        target_user_id=target_user_id,
+        phone=phone,
+        number_id=number_id,
+        is_qr_request=False
+    )
+    await state.set_state(Form.waiting_for_repeat_reply)
+    
+    await callback.message.edit_text(
+        f"📤 **Отправка повторного фото**\n\n"
+        f"📱 Номер: `{escape_markdown(phone)}`\n"
+        f"👤 Получатель: ID `{target_user_id}`\n\n"
+        f"Отправьте фото для повторной отправки:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_resend")]
+        ]),
+        parse_mode="None"
+    )
+    
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("send_qr_"))
+async def send_qr_handler(callback: CallbackQuery, state: FSMContext):
+    """Оператор нажал 'Отправить QR'"""
+    user_id = callback.from_user.id
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
+        return
+    
+    # Формат: send_qr_{number_id}_{target_user_id}
+    parts = callback.data.split("_")
+    
+    if len(parts) < 4:
+        await callback.answer("❌ Ошибка данных", show_alert=True)
+        return
+    
+    try:
+        number_id = int(parts[2])
+        target_user_id = int(parts[3])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Ошибка формата данных", show_alert=True)
+        return
+    
+    # Получаем информацию о номере
+    number_info = db.cursor.execute(
+        "SELECT phone FROM numbers WHERE id = ?",
+        (number_id,)
+    ).fetchone()
+    
+    if not number_info:
+        await callback.answer("❌ Номер не найден", show_alert=True)
+        return
+    
+    phone = number_info[0]
+    
+    # Запрашиваем QR-код у оператора
+    await state.update_data(
+        target_user_id=target_user_id,
+        phone=phone,
+        number_id=number_id,
+        is_qr_request=True
+    )
+    await state.set_state(Form.waiting_for_repeat_reply)
+    
+    await callback.message.edit_text(
+        f"📱 **Отправка QR-кода**\n\n"
+        f"📞 Номер: `{escape_markdown(phone)}`\n"
+        f"👤 Получатель: ID `{target_user_id}`\n\n"
+        f"Отправьте фото QR-кода:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_resend")]
+        ]),
+        parse_mode="None"
+    )
+    
+    await callback.answer()
+
 @dp.callback_query(F.data.startswith("repeat_qr_"))
 async def qr_repeat_handler(callback: CallbackQuery, state: FSMContext):
     """Пользователь нажал кнопку 'Куар'"""
@@ -4942,9 +5372,10 @@ async def qr_repeat_handler(callback: CallbackQuery, state: FSMContext):
         return
     
     try:
+        # parts[0] = "repeat", parts[1] = "qr", parts[2] = number_id, parts[3] = admin_id (опционально)
         number_id = int(parts[2])
         admin_id = int(parts[3]) if len(parts) > 3 else None
-    except ValueError:
+    except (ValueError, IndexError):
         await callback.answer("❌ Ошибка формата данных", show_alert=True)
         return
     
@@ -4991,7 +5422,7 @@ async def qr_repeat_handler(callback: CallbackQuery, state: FSMContext):
     
     # Создаем клавиатуру для быстрого ответа (QR-код)
     quick_reply_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📱 Отправить QR", callback_data=f"quick_qr_{number_id}_{user_id}")]
+        [InlineKeyboardButton(text="📱 Отправить QR", callback_data=f"send_qr_{number_id}_{user_id}")]
     ])
     
     sent_count = 0
@@ -5094,9 +5525,10 @@ async def repeat_photo_handler(callback: CallbackQuery, state: FSMContext):
         return
     
     try:
+        # parts[0] = "repeat", parts[1] = "photo", parts[2] = number_id, parts[3] = admin_id (опционально)
         number_id = int(parts[2])
         admin_id = int(parts[3]) if len(parts) > 3 else None
-    except ValueError:
+    except (ValueError, IndexError):
         await callback.answer("❌ Ошибка формата данных", show_alert=True)
         return
     
@@ -5125,54 +5557,74 @@ async def repeat_photo_handler(callback: CallbackQuery, state: FSMContext):
     
     await callback.answer("✅ Запрос повтора фото отправлен оператору", show_alert=True)
     
-    # Получаем всех операторов для отправки уведомления
-    if admin_id:
-        # Отправляем конкретному оператору
-        admins_to_notify = [admin_id]
-    else:
-        # Отправляем всем операторам
-        admins = db.get_admins_list()
-        admins_to_notify = [a[0] for a in admins] + ADMIN_IDS
-    
-    # Удаляем дубликаты
-    admins_to_notify = list(set(admins_to_notify))
-    
-    # Отправляем уведомление операторам
+    # Отправляем уведомление в группу операторов
     safe_phone = escape_markdown(phone)
     safe_username = escape_markdown(username or f"ID{user_id}")
     
     # Создаем клавиатуру для быстрого ответа (фото)
     quick_reply_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Отправить фото", callback_data=f"quick_resend_{number_id}_{user_id}")]
+        [InlineKeyboardButton(text="📤 Отправить фото", callback_data=f"send_photo_{number_id}_{user_id}")]
     ])
     
-    sent_count = 0
-    for admin_id in admins_to_notify:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"🔄 **Пользователь запросил повторное фото!**\n\n"
-                f"📱 Номер: `{safe_phone}`\n"
-                f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
-                f"Нажмите кнопку ниже для быстрой отправки фото:",
-                reply_markup=quick_reply_kb,
+    # Используем новую функцию для отправки в группу
+    group_message = await send_to_operators_group(
+        f"🔄 **Запрос повторного фото!**\n\n"
+        f"📱 Номер: `{safe_phone}`\n"
+        f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n"
+        f"📋 ID запроса: `{number_id}`\n\n"
+        f"Нажмите кнопку ниже для быстрой отправки фото:",
+        reply_markup=quick_reply_kb
+    )
+    
+    # Если группа не привязана или не удалось отправить, отправляем админам в ЛС
+    if not group_message:
+        # Получаем всех операторов для отправки уведомления
+        if admin_id:
+            # Отправляем конкретному оператору
+            admins_to_notify = [admin_id]
+        else:
+            # Отправляем всем операторам
+            admins = db.get_admins_list()
+            admins_to_notify = [a[0] for a in admins] + ADMIN_IDS
+        
+        # Удаляем дубликаты
+        admins_to_notify = list(set(admins_to_notify))
+        
+        sent_count = 0
+        for admin_id_notify in admins_to_notify:
+            try:
+                await bot.send_message(
+                    admin_id_notify,
+                    f"🔄 **Запрос повторного фото!**\n\n"
+                    f"📱 Номер: `{safe_phone}`\n"
+                    f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n"
+                    f"📋 ID запроса: `{number_id}`\n\n"
+                    f"ℹ️ Группа операторов не привязана!",
+                    reply_markup=quick_reply_kb,
+                    parse_mode="None"
+                )
+                sent_count += 1
+            except Exception as e:
+                logging.error(f"Ошибка отправки оператору {admin_id_notify}: {e}")
+        
+        # Уведомляем пользователя
+        if sent_count > 0:
+            await callback.message.answer(
+                "🔄 **Запрос на повторное фото отправлен операторам!**\n\n"
+                "⏳ Ожидайте фото в ближайшее время.",
                 parse_mode="None"
             )
-            sent_count += 1
-        except Exception as e:
-            logging.error(f"Ошибка отправки оператору {admin_id}: {e}")
-    
-    # Уведомляем пользователя
-    if sent_count > 0:
+        else:
+            await callback.message.answer(
+                "❌ **Не удалось отправить запрос операторам**\n\n"
+                "Пожалуйста, попробуйте позже.",
+                parse_mode="None"
+            )
+    else:
+        # Уведомляем пользователя
         await callback.message.answer(
             "🔄 **Запрос на повторное фото отправлен операторам!**\n\n"
             "⏳ Ожидайте фото в ближайшее время.",
-            parse_mode="None"
-        )
-    else:
-        await callback.message.answer(
-            "❌ **Не удалось отправить запрос операторам**\n\n"
-            "Пожалуйста, попробуйте позже.",
             parse_mode="None"
         )
 
@@ -5223,8 +5675,8 @@ async def repeat_photo_send_handler(message: types.Message, state: FSMContext):
         )
         
         # Создаем новые кнопки для пользователя
-        callback_photo = create_repeat_callback(number_id, user_id, qr_request=False)
-        callback_qr = create_repeat_callback(number_id, user_id, qr_request=True)
+        callback_photo = create_repeat_callback(number_id, user_id, request_type="photo")
+        callback_qr = create_repeat_callback(number_id, user_id, request_type="qr")
         
         # Клавиатура с двумя кнопками
         repeat_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -6040,6 +6492,98 @@ async def check_and_clean_locks():
             pass
         await asyncio.sleep(60)  # Проверяем каждую минуту
 
+# Функции для работы с группой операторов
+def get_operators_group_id():
+    """Получить ID группы операторов из базы"""
+    group_id = db.get_operators_group_id()
+    if group_id:
+        return group_id
+    return None
+
+async def send_to_operators_group(text: str, reply_markup=None):
+    """Отправить сообщение в группу операторов"""
+    group_id = get_operators_group_id()
+    
+    if not group_id:
+        logging.warning("Группа операторов не привязана")
+        # Можно отправить главным админам в ЛС
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"⚠️ **Группа не привязана!**\n\n{text}",
+                    parse_mode="None"
+                )
+            except:
+                pass
+        return None
+    
+    try:
+        message = await bot.send_message(
+            group_id,
+            text,
+            reply_markup=reply_markup,
+            parse_mode="None"
+        )
+        return message
+    except Exception as e:
+        logging.error(f"Ошибка отправки в группу {group_id}: {e}")
+        # Fallback: отправляем главным админам
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"⚠️ **Ошибка отправки в группу!**\n\n{text}",
+                    parse_mode="None"
+                )
+            except:
+                pass
+        return None
+
+async def check_group_connection():
+    """Проверить подключение к группе при старте"""
+    group_id = get_operators_group_id()
+    
+    if group_id:
+        try:
+            # Проверяем, является ли бот участником группы
+            chat_member = await bot.get_chat_member(group_id, bot.id)
+            
+            if chat_member.status not in ['administrator', 'creator']:
+                logging.warning(f"Бот не является администратором группы {group_id}")
+                
+                # Уведомляем главных админов
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await bot.send_message(
+                            admin_id,
+                            f"⚠️ **ВНИМАНИЕ:** Бот не является администратором привязанной группы!\n\n"
+                            f"ID группы: `{group_id}`\n"
+                            f"Пожалуйста, назначьте бота администратором или используйте /remove_group для отвязки.",
+                            parse_mode="None"
+                        )
+                    except:
+                        pass
+            else:
+                logging.info(f"Группа {group_id} подключена, бот является администратором")
+                
+        except Exception as e:
+            logging.error(f"Ошибка проверки группы {group_id}: {e}")
+            
+            # Уведомляем главных админов
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        f"⚠️ **ОШИБКА ПОДКЛЮЧЕНИЯ К ГРУППЕ:**\n\n"
+                        f"ID группы: `{group_id}`\n"
+                        f"Ошибка: {str(e)[:100]}\n\n"
+                        f"Проверьте, что бот добавлен в группу и имеет права администратора.",
+                        parse_mode="None"
+                    )
+                except:
+                    pass
+
 def init_system():
     """Инициализация системы при запуске"""
     # Разблокируем все номера при запуске (на случай перезапуска бота)
@@ -6050,6 +6594,9 @@ async def main():
     """Основная функция запуска бота"""
     # Инициализация системы
     init_system()
+    
+    # Проверяем подключение к группе
+    await check_group_connection()
     
     # Запускаем очистку блокировок в фоне
     asyncio.create_task(check_and_clean_locks())
