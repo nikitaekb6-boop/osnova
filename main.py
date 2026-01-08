@@ -2472,6 +2472,72 @@ async def number_cmd(message: types.Message):
     
     await message.answer(text, reply_markup=kb, parse_mode="None")
 
+# ============================================
+# КОМАНДА ДЛЯ ВОССТАНОВЛЕНИЯ МЕНЮ НОМЕРА
+# ============================================
+
+@dp.message(Command("getnum"))
+async def getnum_cmd(message: types.Message):
+    """Команда /getnum - восстановить меню для взятия номера"""
+    user_id = message.from_user.id
+    
+    # Проверяем права: супер-админ или оператор
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await message.answer("❌ У вас нет прав доступа к этой команде.")
+        return
+    
+    # Очищаем истекшие блокировки
+    db.clear_expired_locks()
+
+    number = db.get_next_number_from_queue()
+    if not number:
+        decreased, amount, new_fake = decrease_fake_queue_gradually()
+        await message.answer("📭 **Очередь пуста.**", parse_mode="None")
+        return
+
+    n_id, phone, u_id, username, is_prio = number
+    
+    # Проверяем блокировку номера
+    locked_by = db.is_number_locked(n_id)
+    if locked_by and locked_by != user_id:
+        await message.answer(f"⚠️ Этот номер уже взят оператором ID: {locked_by}", parse_mode="None")
+        return
+    
+    # Проверяем существование пользователя
+    current_status = db.cursor.execute(
+        "SELECT status FROM numbers WHERE id = ?", 
+        (n_id,)
+    ).fetchone()
+    
+    if current_status and current_status[0] != 'Ожидание':
+        await message.answer("⚠️ Этот номер уже обработан другим оператором!", parse_mode="None")
+        return
+    
+    # Блокируем номер для текущего оператора
+    lock_success, lock_message = db.lock_number_for_admin(n_id, user_id)
+    if not lock_success:
+        await message.answer(lock_message, parse_mode="None")
+        return
+    
+    # Создаем клавиатуру
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Встал", callback_data=f"vstal_{n_id}"),
+         InlineKeyboardButton(text="❌ Слет / Отстоял", callback_data=f"slet_{n_id}")],
+        [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{n_id}"),
+         InlineKeyboardButton(text="⏭ Ошибка / Удалить", callback_data=f"err_{n_id}")]
+    ])
+    
+    _, p_name = db.get_priority_settings()
+    prio_label = f"⭐ [{p_name}] " if is_prio else ""
+    
+    # Экранируем спецсимволы
+    safe_phone = escape_markdown(phone)
+    safe_username = escape_markdown(username or 'User')
+    
+    text = f"{prio_label}📱 **Номер:** `{safe_phone}`\n👤 От: @{safe_username} (ID: `{u_id}`)"
+    
+    await message.answer(text, reply_markup=kb, parse_mode="None")
+
 @dp.message(Command("stats"))
 async def stats_cmd(message: types.Message):
     """Команда /stats - статистика системы"""
