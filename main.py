@@ -1505,7 +1505,9 @@ async def archive_cmd(message: types.Message):
             emo = "✅" if status == "ОТСТОЯЛ" else "❌"
             text += f"{emo} `{phone}` | {tariff_name} | {status}\n"
     
+    # Добавляем кнопку "чат с отзывами"
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Чат с отзывами", url="https://t.me/magic_team_payments")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
     ])
     
@@ -1528,7 +1530,9 @@ async def archive_button_handler(callback: CallbackQuery):
             emo = "✅" if status == "ОТСТОЯЛ" else "❌"
             text += f"{emo} `{phone}` | {tariff_name} | {status}\n"
     
+    # Добавляем кнопку "чат с отзывами"
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Чат с отзывами", url="https://t.me/magic_team_payments")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
     ])
     
