@@ -2428,11 +2428,47 @@ async def admin_panel_back_handler(callback: CallbackQuery):
         return
     
     is_super_admin = callback.from_user.id in ADMIN_IDS
-    await callback.message.edit_text(
+    
+    # Удаляем текущее сообщение (если это сообщение с номером)
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    
+    # Создаем новое сообщение с меню
+    await callback.message.answer(
         "⚙️ **Админ панель**\n\nВыберите действие:",
         reply_markup=get_admin_keyboard(is_super_admin),
         parse_mode="None"
     )
+    await callback.answer()
+
+async def return_to_admin_menu(chat_id, user_id, message_id=None):
+    """Вернуться в админ-меню"""
+    is_super_admin = user_id in ADMIN_IDS
+    
+    # Если передано message_id, редактируем сообщение
+    if message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="⚙️ **Админ панель**\n\nВыберите действие:",
+                reply_markup=get_admin_keyboard(is_super_admin),
+                parse_mode="None"
+            )
+            return True
+        except:
+            pass
+    
+    # Иначе создаем новое сообщение
+    await bot.send_message(
+        chat_id,
+        "⚙️ **Админ панель**\n\nВыберите действие:",
+        reply_markup=get_admin_keyboard(is_super_admin),
+        parse_mode="None"
+    )
+    return True
 
 # ============================================
 # КОМАНДЫ ДЛЯ АДМИНИСТРАТОРОВ
@@ -2519,18 +2555,18 @@ async def getnum_cmd(message: types.Message):
         await message.answer(lock_message, parse_mode="None")
         return
     
-    # Создаем клавиатуру
+    # Создаем клавиатуру с кнопкой меню
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Встал", callback_data=f"vstal_{n_id}"),
          InlineKeyboardButton(text="❌ Слет / Отстоял", callback_data=f"slet_{n_id}")],
         [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{n_id}"),
-         InlineKeyboardButton(text="⏭ Ошибка / Удалить", callback_data=f"err_{n_id}")]
+         InlineKeyboardButton(text="⏭ Ошибка / Удалить", callback_data=f"err_{n_id}")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="admin_panel_back")]
     ])
     
     _, p_name = db.get_priority_settings()
     prio_label = f"⭐ [{p_name}] " if is_prio else ""
     
-    # Экранируем спецсимволы
     safe_phone = escape_markdown(phone)
     safe_username = escape_markdown(username or 'User')
     
@@ -2646,11 +2682,13 @@ async def admin_take_fast_handler(callback: CallbackQuery):
         await callback.answer(lock_message, show_alert=True)
         return
     
+    # Создаем клавиатуру
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Встал", callback_data=f"vstal_{n_id}"),
          InlineKeyboardButton(text="❌ Слет / Отстоял", callback_data=f"slet_{n_id}")],
         [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{n_id}"),
-         InlineKeyboardButton(text="⏭ Ошибка / Удалить", callback_data=f"err_{n_id}")]
+         InlineKeyboardButton(text="⏭ Ошибка / Удалить", callback_data=f"err_{n_id}")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="admin_panel_back")]  # Добавлена кнопка меню
     ])
     
     _, p_name = db.get_priority_settings()
@@ -2670,9 +2708,14 @@ async def admin_take_fast_handler(callback: CallbackQuery):
         
         text += f"\n\n📊 **Очередь:** {total_count} (реальных: {real_count}, фейковых: {fake_count})"
     
-    # Отправляем новое сообщение с номером
-    await callback.message.answer(text, reply_markup=kb, parse_mode="None")
-    await callback.answer()
+    # **ИЗМЕНЕНИЕ: РЕДАКТИРУЕМ текущее сообщение вместо создания нового**
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="None")
+        await callback.answer("📱 Номер показан")
+    except Exception as e:
+        # Если не получается отредактировать, создаем новое сообщение
+        await callback.message.answer(text, reply_markup=kb, parse_mode="None")
+        await callback.answer("📱 Номер показан")
 
 @dp.callback_query(F.data == "admin_base")
 async def admin_base_handler(callback: CallbackQuery, state: FSMContext):
@@ -4377,11 +4420,12 @@ async def vstal_handler(callback: CallbackQuery):
         
         new_text = f"{prio_label}📱 **Номер:** `{safe_phone}`\n👤 От: @{safe_username} (ID: `{u_id}`)\n\n🟡 **СТАТУС: В РАБОТЕ**"
         
-        # Обновляем клавиатуру
+        # Обновляем клавиатуру - ДОБАВЛЯЕМ КНОПКУ МЕНЮ
         new_kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🏁 Завершить", callback_data=f"slet_{n_id}")],
             [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{n_id}"),
-             InlineKeyboardButton(text="⏭ Ошибка", callback_data=f"err_{n_id}")]
+             InlineKeyboardButton(text="⏭ Ошибка", callback_data=f"err_{n_id}")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="admin_panel_back")]  # Добавлено
         ])
         
         await callback.message.edit_text(new_text, reply_markup=new_kb, parse_mode="None")
