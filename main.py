@@ -4418,19 +4418,20 @@ async def vstal_handler(callback: CallbackQuery):
         safe_phone = escape_markdown(phone)
         safe_username = escape_markdown(username or 'User')
         
+        # Вместо удаления сообщения, создаем новое с обновленными кнопками
         new_text = f"{prio_label}📱 **Номер:** `{safe_phone}`\n👤 От: @{safe_username} (ID: `{u_id}`)\n\n🟡 **СТАТУС: В РАБОТЕ**"
-        
-        # Обновляем клавиатуру - ДОБАВЛЯЕМ КНОПКУ МЕНЮ
+
         new_kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🏁 Завершить", callback_data=f"slet_{n_id}")],
             [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{n_id}"),
              InlineKeyboardButton(text="⏭ Ошибка", callback_data=f"err_{n_id}")],
-            [InlineKeyboardButton(text="🏠 В меню", callback_data="admin_panel_back")]  # Добавлено
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="admin_panel_back")]
         ])
-        
-        await callback.message.edit_text(new_text, reply_markup=new_kb, parse_mode="None")
-        
-        # После успешного взятия номера удаляем сообщение, чтобы другие не видели
+
+        # Создаем новое сообщение с меню
+        await callback.message.answer(new_text, reply_markup=new_kb, parse_mode="None")
+
+        # Удаляем старое сообщение с номером в очереди
         try:
             await callback.message.delete()
         except:
