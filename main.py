@@ -291,6 +291,21 @@ class Database:
             """)
         except:
             pass
+        
+        # Таблица для блокировки номеров
+        try:
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS number_locks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    number_id INTEGER,
+                    admin_id INTEGER,
+                    expires_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (number_id) REFERENCES numbers (id)
+                )
+            """)
+        except:
+            pass
 
     # РЕФЕРАЛЬНАЯ СИСТЕМА
     def get_referral_bonus(self):
@@ -1190,6 +1205,48 @@ class Database:
             SELECT user_id, username, balance, total_numbers, is_banned, priority
             FROM users WHERE user_id = ?
         """, (user_id,)).fetchone()
+
+    # МЕТОДЫ БЛОКИРОВКИ НОМЕРОВ
+    def lock_number_for_admin(self, number_id, admin_id):
+        """Заблокировать номер для оператора"""
+        with self.connection:
+            # Проверяем, не заблокирован ли уже номер другим оператором
+            locked_by = self.cursor.execute(
+                "SELECT admin_id FROM number_locks WHERE number_id = ? AND expires_at > datetime('now')",
+                (number_id,)
+            ).fetchone()
+            
+            if locked_by:
+                return False, f"Номер уже взят оператором ID: {locked_by[0]}"
+            
+            # Удаляем старые блокировки для этого номера
+            self.cursor.execute("DELETE FROM number_locks WHERE number_id = ?", (number_id,))
+            
+            # Создаем новую блокировку на 5 минут
+            expires_at = (datetime.now() + timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+            self.cursor.execute(
+                "INSERT INTO number_locks (number_id, admin_id, expires_at) VALUES (?, ?, ?)",
+                (number_id, admin_id, expires_at)
+            )
+            return True, "Номер заблокирован"
+    
+    def unlock_number(self, number_id):
+        """Разблокировать номер"""
+        with self.connection:
+            self.cursor.execute("DELETE FROM number_locks WHERE number_id = ?", (number_id,))
+    
+    def is_number_locked(self, number_id):
+        """Проверить, заблокирован ли номер"""
+        res = self.cursor.execute(
+            "SELECT admin_id FROM number_locks WHERE number_id = ? AND expires_at > datetime('now')",
+            (number_id,)
+        ).fetchone()
+        return res[0] if res else None
+    
+    def clear_expired_locks(self):
+        """Очистить истекшие блокировки"""
+        with self.connection:
+            self.cursor.execute("DELETE FROM number_locks WHERE expires_at <= datetime('now')")
 
 # --- КОНФИГУРАЦИЯ БОТА ---
 
@@ -2496,7 +2553,7 @@ async def base_cmd(message: types.Message):
 
 @dp.callback_query(F.data == "admin_take_fast")
 async def admin_take_fast_handler(callback: CallbackQuery):
-    """Кнопка взять номер с периодическим уменьшением фейковой очереди"""
+    """Кнопка взять номер с блокировкой"""
     user_id = callback.from_user.id
     
     # Проверяем права: супер-админ или оператор
@@ -2504,30 +2561,37 @@ async def admin_take_fast_handler(callback: CallbackQuery):
         await callback.answer("❌ У вас нет прав доступа", show_alert=True)
         return
 
+    # Очищаем истекшие блокировки
+    db.clear_expired_locks()
+
     number = db.get_next_number_from_queue()
     if not number:
-        # Если очередь пустая, уменьшаем фейковую очередь автоматически (БЕЗ УВЕДОМЛЕНИЙ)
         decreased, amount, new_fake = decrease_fake_queue_gradually()
-        
-        if decreased:
-            # НЕ показываем уведомление об уменьшении
-            await callback.answer("📭 Очередь пуста.", show_alert=True)
-        else:
-            await callback.answer("📭 Очередь пуста.", show_alert=True)
+        await callback.answer("📭 Очередь пуста.", show_alert=True)
         return
 
     n_id, phone, u_id, username, is_prio = number
     
-    # Проверяем, не взят ли уже номер другим оператором
+    # Проверяем, не заблокирован ли номер другим оператором
+    locked_by = db.is_number_locked(n_id)
+    if locked_by and locked_by != user_id:
+        await callback.answer(f"⚠️ Этот номер уже взят оператором ID: {locked_by}", show_alert=True)
+        return
+    
+    # Проверяем существование пользователя
     current_status = db.cursor.execute(
         "SELECT status FROM numbers WHERE id = ?", 
         (n_id,)
     ).fetchone()
     
     if current_status and current_status[0] != 'Ожидание':
-        await callback.answer("⚠️ Этот номер уже взят другим оператором!", show_alert=True)
-        # Обновляем список номеров
-        await admin_take_fast_handler(callback)
+        await callback.answer("⚠️ Этот номер уже обработан другим оператором!", show_alert=True)
+        return
+    
+    # Блокируем номер для текущего оператора
+    lock_success, lock_message = db.lock_number_for_admin(n_id, user_id)
+    if not lock_success:
+        await callback.answer(lock_message, show_alert=True)
         return
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -4205,13 +4269,23 @@ async def remove_admin_handler(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("vstal_"))
 async def vstal_handler(callback: CallbackQuery):
-    """Номер взят в работу с уменьшением фейковой очереди"""
+    """Номер взят в работу с блокировкой"""
     user_id = callback.from_user.id
     if user_id not in ADMIN_IDS and not db.is_admin(user_id):
         await callback.answer("❌ У вас нет прав доступа", show_alert=True)
         return
     
     n_id = callback.data.split("_")[1]
+    
+    # Проверяем блокировку номера
+    locked_by = db.is_number_locked(n_id)
+    if locked_by and locked_by != user_id:
+        await callback.answer(f"⚠️ Этот номер уже взят оператором ID: {locked_by}", show_alert=True)
+        try:
+            await callback.message.delete()
+        except:
+            pass
+        return
     
     # Проверяем, не взят ли уже номер другим оператором
     current_status = db.cursor.execute(
@@ -4259,6 +4333,12 @@ async def vstal_handler(callback: CallbackQuery):
         ])
         
         await callback.message.edit_text(new_text, reply_markup=new_kb, parse_mode="None")
+        
+        # После успешного взятия номера удаляем сообщение, чтобы другие не видели
+        try:
+            await callback.message.delete()
+        except:
+            pass
     else:
         await callback.answer("❌ Ошибка при взятии номера", show_alert=True)
 
@@ -4289,6 +4369,9 @@ async def slet_handler(callback: CallbackQuery):
     
     # Передаем флаг админа в метод set_number_slet
     res = db.set_number_slet(n_id, is_admin=is_super_admin)
+    
+    # Разблокируем номер после завершения
+    db.unlock_number(n_id)
     
     if res:
         # Уменьшаем фейковую очередь при завершении номера
@@ -5206,8 +5289,29 @@ async def download_users_report_handler(callback: CallbackQuery):
 # ЗАПУСК БОТА
 # ============================================
 
+async def check_and_clean_locks():
+    """Периодическая очистка истекших блокировок"""
+    while True:
+        try:
+            db.clear_expired_locks()
+        except:
+            pass
+        await asyncio.sleep(60)  # Проверяем каждую минуту
+
+def init_system():
+    """Инициализация системы при запуске"""
+    # Разблокируем все номера при запуске (на случай перезапуска бота)
+    db.cursor.execute("DELETE FROM number_locks")
+    db.connection.commit()
+
 async def main():
     """Основная функция запуска бота"""
+    # Инициализация системы
+    init_system()
+    
+    # Запускаем очистку блокировок в фоне
+    asyncio.create_task(check_and_clean_locks())
+    
     logging.basicConfig(level=logging.INFO)
     await dp.start_polling(bot)
 
