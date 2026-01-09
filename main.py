@@ -4750,7 +4750,7 @@ async def simple_repeat_handler(callback: CallbackQuery, state: FSMContext):
     
     # Создаем клавиатуру для быстрого ответа с указанием типа запроса
     quick_reply_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Отправить повтор", callback_data=f"quick_resend_{number_id}_{user_id}_{request_type}")]
+        [InlineKeyboardButton(text="🔄 Отправить повтор", callback_data=f"admin_repeat_{request_type}_{number_id}_{user_id}")]
     ])
     
     # Пытаемся найти и отредактировать существующее сообщение оператора
@@ -4787,7 +4787,7 @@ async def simple_repeat_handler(callback: CallbackQuery, state: FSMContext):
                      InlineKeyboardButton(text="❌ Слет / Отстоял", callback_data=f"slet_{number_id}")],
                     [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{number_id}"),
                      InlineKeyboardButton(text="⏭ Ошибка / Удалить", callback_data=f"err_{number_id}")],
-                    [InlineKeyboardButton(text="📤 Отправить повтор", callback_data=f"quick_resend_{number_id}_{user_id}_{request_type}")]
+                    [InlineKeyboardButton(text="🔄 Отправить повтор", callback_data=f"admin_repeat_{request_type}_{number_id}_{user_id}")]
                 ])
                 
                 await bot.edit_message_text(
@@ -4908,7 +4908,7 @@ async def repeat_handler(callback: CallbackQuery, state: FSMContext):
     
     # Создаем клавиатуру для быстрого ответа
     quick_reply_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Отправить повтор", callback_data=f"quick_resend_{number_id}_{user_id}_photo")]
+        [InlineKeyboardButton(text="🔄 Отправить повтор", callback_data=f"admin_repeat_photo_{number_id}_{user_id}")]
     ])
     
     # Пытаемся найти и отредактировать существующее сообщение оператора
@@ -4938,7 +4938,7 @@ async def repeat_handler(callback: CallbackQuery, state: FSMContext):
                      InlineKeyboardButton(text="❌ Слет / Отстоял", callback_data=f"slet_{number_id}")],
                     [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{number_id}"),
                      InlineKeyboardButton(text="⏭ Ошибка / Удалить", callback_data=f"err_{number_id}")],
-                    [InlineKeyboardButton(text="📤 Отправить повтор", callback_data=f"quick_resend_{number_id}_{user_id}_photo")]
+                    [InlineKeyboardButton(text="🔄 Отправить повтор", callback_data=f"admin_repeat_photo_{number_id}_{user_id}")]
                 ])
                 
                 await bot.edit_message_text(
@@ -4987,10 +4987,10 @@ async def repeat_handler(callback: CallbackQuery, state: FSMContext):
                 )
                 edited_count += 1
             except Exception as e:
-            logging.error(f"Ошибка отправки оператору {admin_id}: {e}")
+                logging.error(f"Ошибка отправки оператору {admin_id_item}: {e}")
     
     # Уведомляем пользователя
-    if sent_count > 0:
+    if edited_count > 0:
         await callback.message.answer(
             "🔄 **Запрос на повтор отправлен операторам!**\n\n"
             "⏳ Ожидайте повторной отправки фото в ближайшее время.",
@@ -5022,6 +5022,75 @@ async def quick_resend_handler(callback: CallbackQuery, state: FSMContext):
         number_id = int(parts[2])
         target_user_id = int(parts[3])
         request_type = parts[4] if len(parts) > 4 else "photo"
+        
+        # Проверяем валидность типа запроса
+        if request_type not in ["photo", "qr"]:
+            request_type = "photo"
+    except (ValueError, IndexError) as e:
+        await callback.answer("❌ Ошибка формата данных", show_alert=True)
+        logging.error(f"Ошибка парсинга callback_data {callback.data}: {e}")
+        return
+    
+    # Получаем информацию о номере
+    number_info = db.cursor.execute(
+        "SELECT phone FROM numbers WHERE id = ?",
+        (number_id,)
+    ).fetchone()
+    
+    if not number_info:
+        await callback.answer("❌ Номер не найден", show_alert=True)
+        return
+    
+    phone = number_info[0]
+    
+    # Определяем, это запрос QR или фото
+    is_qr_request = (request_type == "qr")
+    request_text = "QR-код" if is_qr_request else "фото"
+    
+    # Сохраняем данные в состояние для отправки медиа
+    await state.update_data(
+        reply_to_user_id=target_user_id,
+        target_user_id=target_user_id,
+        phone=phone,
+        number_id=number_id,
+        request_type=request_type,
+        is_qr_request=is_qr_request
+    )
+    await state.set_state(Form.waiting_for_repeat_reply)
+    
+    safe_phone = escape_markdown(phone)
+    await callback.message.edit_text(
+        f"📤 **Отправка {request_text} пользователю**\n\n"
+        f"📱 Номер: `{safe_phone}`\n"
+        f"👤 Получатель: ID `{target_user_id}`\n\n"
+        f"Отправьте {request_text} для пользователя (фото, изображение QR-кода и т.д.):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_resend")]
+        ]),
+        parse_mode="None"
+    )
+    
+    await callback.answer()
+
+# Обработчик для повторной отправки оператором (формат admin_repeat_)
+@dp.callback_query(F.data.startswith("admin_repeat_"))
+async def admin_repeat_handler(callback: CallbackQuery, state: FSMContext):
+    """Оператор нажал кнопку быстрой отправки повторного фото/QR через admin_repeat_"""
+    user_id = callback.from_user.id
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
+        return
+    
+    parts = callback.data.split("_")
+    if len(parts) < 5:
+        await callback.answer("❌ Ошибка данных", show_alert=True)
+        return
+    
+    try:
+        # Формат: admin_repeat_{request_type}_{number_id}_{target_user_id}
+        request_type = parts[2]  # "photo" или "qr"
+        number_id = int(parts[3])
+        target_user_id = int(parts[4])
         
         # Проверяем валидность типа запроса
         if request_type not in ["photo", "qr"]:
