@@ -2475,6 +2475,115 @@ async def return_to_admin_menu(chat_id, user_id, message_id=None):
     )
     return True
 
+async def restore_number_menu(number_id, operator_id=None):
+    """
+    Восстанавливает меню управления номером для оператора
+    
+    Args:
+        number_id: ID номера
+        operator_id: ID оператора (если None, используется оператор из operator_number_messages)
+    
+    Returns:
+        True если меню восстановлено, False если не удалось
+    """
+    try:
+        # Получаем информацию о номере
+        number_info = db.cursor.execute(
+            """SELECT n.phone, n.user_id, u.username, n.is_priority 
+               FROM numbers n 
+               LEFT JOIN users u ON n.user_id = u.user_id 
+               WHERE n.id = ?""",
+            (number_id,)
+        ).fetchone()
+        
+        if not number_info:
+            return False
+        
+        phone, user_id, username, is_prio = number_info
+        
+        # Определяем оператора
+        if number_id in operator_number_messages:
+            saved_operator_id, saved_message_id, saved_chat_id = operator_number_messages[number_id]
+            if operator_id is None or saved_operator_id == operator_id:
+                operator_id = saved_operator_id
+                message_id = saved_message_id
+                chat_id = saved_chat_id
+            else:
+                return False
+        elif operator_id:
+            # Если номер не найден в operator_number_messages, но указан operator_id
+            # Пытаемся найти сообщение через базу данных
+            chat_id = operator_id
+            message_id = None  # Будем отправлять новое сообщение
+        else:
+            return False
+        
+        # Получаем настройки приоритета
+        _, p_name = db.get_priority_settings()
+        prio_label = f"⭐ [{p_name}] " if is_prio else ""
+        
+        # Экранируем спецсимволы
+        safe_phone = escape_markdown(phone)
+        safe_username = escape_markdown(username or 'User')
+        
+        # Текст меню
+        text = f"{prio_label}📱 **Номер:** `{safe_phone}`\n👤 От: @{safe_username} (ID: `{user_id}`)"
+        
+        # Создаем клавиатуру со стандартными кнопками
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Встал", callback_data=f"vstal_{number_id}"),
+             InlineKeyboardButton(text="❌ Слет / Отстоял", callback_data=f"slet_{number_id}")],
+            [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{number_id}"),
+             InlineKeyboardButton(text="⏭ Ошибка / Удалить", callback_data=f"err_{number_id}")]
+        ])
+        
+        # Пытаемся отредактировать существующее сообщение или отправить новое
+        if message_id:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=kb,
+                    parse_mode="None"
+                )
+                return True
+            except Exception as e:
+                logging.error(f"Ошибка редактирования меню номера {number_id}: {e}")
+                # Если не удалось отредактировать, отправляем новое сообщение
+                try:
+                    sent_message = await bot.send_message(
+                        chat_id,
+                        text,
+                        reply_markup=kb,
+                        parse_mode="None"
+                    )
+                    # Обновляем operator_number_messages
+                    operator_number_messages[number_id] = (operator_id, sent_message.message_id, sent_message.chat.id)
+                    return True
+                except Exception as e2:
+                    logging.error(f"Ошибка отправки нового меню номера {number_id}: {e2}")
+                    return False
+        else:
+            # Отправляем новое сообщение
+            try:
+                sent_message = await bot.send_message(
+                    chat_id,
+                    text,
+                    reply_markup=kb,
+                    parse_mode="None"
+                )
+                # Обновляем operator_number_messages
+                operator_number_messages[number_id] = (operator_id, sent_message.message_id, sent_message.chat.id)
+                return True
+            except Exception as e:
+                logging.error(f"Ошибка отправки меню номера {number_id}: {e}")
+                return False
+                
+    except Exception as e:
+        logging.error(f"Ошибка восстановления меню номера {number_id}: {e}")
+        return False
+
 # ============================================
 # КОМАНДЫ ДЛЯ АДМИНИСТРАТОРОВ
 # ============================================
@@ -5134,19 +5243,81 @@ async def admin_repeat_handler(callback: CallbackQuery, state: FSMContext):
         f"👤 Получатель: ID `{target_user_id}`\n\n"
         f"Отправьте {request_text} для пользователя (фото, изображение QR-кода и т.д.):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_resend")]
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"back_to_number_{number_id}")]
         ]),
         parse_mode="None"
     )
     
     await callback.answer()
 
+@dp.callback_query(F.data.startswith("back_to_number_"))
+async def back_to_number_handler(callback: CallbackQuery, state: FSMContext):
+    """Возврат к меню управления номером"""
+    user_id = callback.from_user.id
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
+        return
+    
+    # Извлекаем number_id из callback_data: back_to_number_{number_id}
+    parts = callback.data.split("_")
+    if len(parts) < 4:
+        await callback.answer("❌ Ошибка данных", show_alert=True)
+        await state.clear()
+        return
+    
+    try:
+        number_id = int(parts[3])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Ошибка формата данных", show_alert=True)
+        await state.clear()
+        return
+    
+    # Очищаем состояние
+    await state.clear()
+    
+    # Восстанавливаем меню номера
+    success = await restore_number_menu(number_id, operator_id=user_id)
+    
+    if success:
+        await callback.answer("✅ Возврат к меню номера")
+        # Удаляем сообщение с запросом фото или редактируем его
+        try:
+            await callback.message.delete()
+        except:
+            pass
+    else:
+        await callback.answer("❌ Не удалось восстановить меню", show_alert=True)
+
 @dp.callback_query(F.data == "cancel_resend")
 async def cancel_resend_handler(callback: CallbackQuery, state: FSMContext):
     """Отмена повторной отправки"""
+    user_id = callback.from_user.id
+    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
+        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
+        await state.clear()
+        return
+    
+    # Пытаемся получить number_id из состояния
+    data = await state.get_data()
+    number_id = data.get('number_id')
+    
     await state.clear()
-    await callback.message.edit_text("❌ Отправка отменена")
-    await callback.answer()
+    
+    # Если есть number_id, восстанавливаем меню
+    if number_id:
+        success = await restore_number_menu(number_id, operator_id=user_id)
+        if success:
+            await callback.answer("✅ Отправка отменена. Возврат к меню номера")
+            try:
+                await callback.message.delete()
+            except:
+                pass
+        else:
+            await callback.message.edit_text("❌ Отправка отменена")
+            await callback.answer()
+    else:
+        await callback.message.edit_text("❌ Отправка отменена")
+        await callback.answer()
 
 @dp.callback_query(F.data.startswith("send_photo_"))
 async def send_photo_handler(callback: CallbackQuery, state: FSMContext):
@@ -5711,6 +5882,10 @@ async def repeat_photo_send_handler(message: types.Message, state: FSMContext):
             f"👤 Получатель: ID `{target_user_id}`",
             parse_mode="None"
         )
+        
+        # Восстанавливаем меню управления номером после отправки
+        if number_id:
+            await restore_number_menu(number_id, operator_id=user_id)
         
     except Exception as e:
         await message.answer(f"❌ Ошибка отправки: {str(e)}")
