@@ -1246,6 +1246,10 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 db = Database("bot_database.db")
 
+# Словарь для хранения связей номеров с сообщениями операторов
+# Формат: {number_id: (operator_id, message_id, chat_id)}
+operator_number_messages = {}
+
 class Form(StatesGroup):
     waiting_for_number = State()
     waiting_for_new_admin_id = State()
@@ -2507,7 +2511,9 @@ async def number_cmd(message: types.Message):
     
     text = f"{prio_label}📱 **Номер:** `{safe_phone}`\n👤 От: @{safe_username} (ID: `{u_id}`)"
     
-    await message.answer(text, reply_markup=kb, parse_mode="None")
+    sent_message = await message.answer(text, reply_markup=kb, parse_mode="None")
+    # Сохраняем message_id для связи с номером
+    operator_number_messages[n_id] = (user_id, sent_message.message_id, sent_message.chat.id)
 
 # ============================================
 # КОМАНДА ДЛЯ ВОССТАНОВЛЕНИЯ МЕНЮ НОМЕРА
@@ -2573,7 +2579,9 @@ async def getnum_cmd(message: types.Message):
     
     text = f"{prio_label}📱 **Номер:** `{safe_phone}`\n👤 От: @{safe_username} (ID: `{u_id}`)"
     
-    await message.answer(text, reply_markup=kb, parse_mode="None")
+    sent_message = await message.answer(text, reply_markup=kb, parse_mode="None")
+    # Сохраняем message_id для связи с номером
+    operator_number_messages[n_id] = (user_id, sent_message.message_id, sent_message.chat.id)
 
 @dp.message(Command("stats"))
 async def stats_cmd(message: types.Message):
@@ -2712,10 +2720,14 @@ async def admin_take_fast_handler(callback: CallbackQuery):
     # **ИЗМЕНЕНИЕ: РЕДАКТИРУЕМ текущее сообщение вместо создания нового**
     try:
         await callback.message.edit_text(text, reply_markup=kb, parse_mode="None")
+        # Сохраняем message_id для связи с номером (редактируем существующее сообщение)
+        operator_number_messages[n_id] = (user_id, callback.message.message_id, callback.message.chat.id)
         await callback.answer("📱 Номер показан")
     except Exception as e:
         # Если не получается отредактировать, создаем новое сообщение
-        await callback.message.answer(text, reply_markup=kb, parse_mode="None")
+        sent_message = await callback.message.answer(text, reply_markup=kb, parse_mode="None")
+        # Сохраняем message_id для связи с номером
+        operator_number_messages[n_id] = (user_id, sent_message.message_id, sent_message.chat.id)
         await callback.answer("📱 Номер показан")
 
 @dp.callback_query(F.data == "admin_base")
@@ -4732,19 +4744,7 @@ async def simple_repeat_handler(callback: CallbackQuery, state: FSMContext):
     request_text = "фото" if request_type == "photo" else "QR-код"
     await callback.answer(f"✅ Запрос {request_text} отправлен оператору", show_alert=True)
     
-    # Получаем всех операторов для отправки уведомления
-    if admin_id:
-        # Отправляем конкретному оператору
-        admins_to_notify = [int(admin_id)]
-    else:
-        # Отправляем всем операторам
-        admins = db.get_admins_list()
-        admins_to_notify = [a[0] for a in admins] + ADMIN_IDS
-    
-    # Удаляем дубликаты
-    admins_to_notify = list(set(admins_to_notify))
-    
-    # Отправляем уведомление операторам
+    # Подготовка данных
     safe_phone = escape_markdown(phone)
     safe_username = escape_markdown(username or f"ID{user_id}")
     
@@ -4753,32 +4753,102 @@ async def simple_repeat_handler(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="📤 Отправить повтор", callback_data=f"quick_resend_{number_id}_{user_id}_{request_type}")]
     ])
     
-    sent_count = 0
-    for admin_id_item in admins_to_notify:
-        try:
-            await bot.send_message(
-                admin_id_item,
-                f"🔄 **Пользователь запросил {request_text}!**\n\n"
-                f"📱 Номер: `{safe_phone}`\n"
-                f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
-                f"Нажмите кнопку ниже для быстрой отправки {request_text}:",
-                reply_markup=quick_reply_kb,
-                parse_mode="None"
-            )
-            sent_count += 1
-        except Exception as e:
-            logging.error(f"Ошибка отправки оператору {admin_id_item}: {e}")
+    # Пытаемся найти и отредактировать существующее сообщение оператора
+    edited_count = 0
+    
+    if number_id in operator_number_messages:
+        # Найдено сохраненное сообщение для этого номера
+        saved_operator_id, saved_message_id, saved_chat_id = operator_number_messages[number_id]
+        
+        # Проверяем, нужно ли уведомлять именно этого оператора
+        if admin_id is None or saved_operator_id == admin_id:
+            try:
+                # Получаем информацию о приоритете номера для восстановления полного текста
+                number_prio_info = db.cursor.execute(
+                    "SELECT is_priority FROM numbers WHERE id = ?", (number_id,)
+                ).fetchone()
+                is_prio = number_prio_info[0] if number_prio_info else 0
+                _, p_name = db.get_priority_settings()
+                prio_label = f"⭐ [{p_name}] " if is_prio else ""
+                
+                # Восстанавливаем оригинальный текст
+                original_text = f"{prio_label}📱 **Номер:** `{safe_phone}`\n👤 От: @{safe_username} (ID: `{user_id}`)"
+                
+                # Редактируем сообщение, добавляя информацию о запросе
+                new_text = (
+                    f"{original_text}\n\n"
+                    f"🔄 **Пользователь запросил {request_text}!**\n\n"
+                    f"Нажмите кнопку ниже для быстрой отправки {request_text}:"
+                )
+                
+                # Создаем клавиатуру со стандартными кнопками + кнопкой быстрого ответа
+                combined_kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Встал", callback_data=f"vstal_{number_id}"),
+                     InlineKeyboardButton(text="❌ Слет / Отстоял", callback_data=f"slet_{number_id}")],
+                    [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{number_id}"),
+                     InlineKeyboardButton(text="⏭ Ошибка / Удалить", callback_data=f"err_{number_id}")],
+                    [InlineKeyboardButton(text="📤 Отправить повтор", callback_data=f"quick_resend_{number_id}_{user_id}_{request_type}")]
+                ])
+                
+                await bot.edit_message_text(
+                    chat_id=saved_chat_id,
+                    message_id=saved_message_id,
+                    text=new_text,
+                    reply_markup=combined_kb,
+                    parse_mode="None"
+                )
+                edited_count += 1
+            except Exception as e:
+                logging.error(f"Ошибка редактирования сообщения оператора {saved_operator_id}: {e}")
+                # Если не удалось отредактировать, отправляем новое сообщение как fallback
+                try:
+                    await bot.send_message(
+                        saved_operator_id,
+                        f"🔄 **Пользователь запросил {request_text}!**\n\n"
+                        f"📱 Номер: `{safe_phone}`\n"
+                        f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
+                        f"Нажмите кнопку ниже для быстрой отправки {request_text}:",
+                        reply_markup=quick_reply_kb,
+                        parse_mode="None"
+                    )
+                    edited_count += 1
+                except Exception as e2:
+                    logging.error(f"Ошибка отправки сообщения оператору {saved_operator_id}: {e2}")
+    else:
+        # Сообщение не найдено, отправляем новое (fallback)
+        if admin_id:
+            admins_to_notify = [int(admin_id)]
+        else:
+            admins = db.get_admins_list()
+            admins_to_notify = [a[0] for a in admins] + ADMIN_IDS
+        
+        admins_to_notify = list(set(admins_to_notify))
+        
+        for admin_id_item in admins_to_notify:
+            try:
+                await bot.send_message(
+                    admin_id_item,
+                    f"🔄 **Пользователь запросил {request_text}!**\n\n"
+                    f"📱 Номер: `{safe_phone}`\n"
+                    f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
+                    f"Нажмите кнопку ниже для быстрой отправки {request_text}:",
+                    reply_markup=quick_reply_kb,
+                    parse_mode="None"
+                )
+                edited_count += 1
+            except Exception as e:
+                logging.error(f"Ошибка отправки оператору {admin_id_item}: {e}")
     
     # Уведомляем пользователя
-    if sent_count > 0:
+    if edited_count > 0:
         await callback.message.answer(
-            f"🔄 **Запрос на {request_text} отправлен операторам!**\n\n"
+            f"🔄 **Запрос на {request_text} отправлен оператору!**\n\n"
             "⏳ Ожидайте повторной отправки в ближайшее время.",
             parse_mode="None"
         )
     else:
         await callback.message.answer(
-            "❌ **Не удалось отправить запрос операторам**\n\n"
+            "❌ **Не удалось отправить запрос оператору**\n\n"
             "Пожалуйста, попробуйте позже.",
             parse_mode="None"
         )
@@ -4831,41 +4901,92 @@ async def repeat_handler(callback: CallbackQuery, state: FSMContext):
     
     await callback.answer("✅ Запрос повтора отправлен оператору", show_alert=True)
     
-    # Получаем всех операторов для отправки уведомления
-    if admin_id:
-        # Отправляем конкретному оператору
-        admins_to_notify = [admin_id]
-    else:
-        # Отправляем всем операторам
-        admins = db.get_admins_list()
-        admins_to_notify = [a[0] for a in admins] + ADMIN_IDS
-    
-    # Удаляем дубликаты
-    admins_to_notify = list(set(admins_to_notify))
-    
-    # Отправляем уведомление операторам
+    # Подготовка данных
     safe_phone = escape_markdown(phone)
     safe_username = escape_markdown(username or f"ID{user_id}")
+    request_text = "фото"
     
     # Создаем клавиатуру для быстрого ответа
     quick_reply_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Отправить повтор", callback_data=f"quick_resend_{number_id}_{user_id}")]
+        [InlineKeyboardButton(text="📤 Отправить повтор", callback_data=f"quick_resend_{number_id}_{user_id}_photo")]
     ])
     
-    sent_count = 0
-    for admin_id in admins_to_notify:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"🔄 **Пользователь запросил повтор!**\n\n"
-                f"📱 Номер: `{safe_phone}`\n"
-                f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
-                f"Нажмите кнопку ниже для быстрой отправки повторного фото:",
-                reply_markup=quick_reply_kb,
-                parse_mode="None"
-            )
-            sent_count += 1
-        except Exception as e:
+    # Пытаемся найти и отредактировать существующее сообщение оператора
+    edited_count = 0
+    
+    if number_id in operator_number_messages:
+        saved_operator_id, saved_message_id, saved_chat_id = operator_number_messages[number_id]
+        
+        if admin_id is None or saved_operator_id == admin_id:
+            try:
+                number_prio_info = db.cursor.execute(
+                    "SELECT is_priority FROM numbers WHERE id = ?", (number_id,)
+                ).fetchone()
+                is_prio = number_prio_info[0] if number_prio_info else 0
+                _, p_name = db.get_priority_settings()
+                prio_label = f"⭐ [{p_name}] " if is_prio else ""
+                
+                original_text = f"{prio_label}📱 **Номер:** `{safe_phone}`\n👤 От: @{safe_username} (ID: `{user_id}`)"
+                new_text = (
+                    f"{original_text}\n\n"
+                    f"🔄 **Пользователь запросил {request_text}!**\n\n"
+                    f"Нажмите кнопку ниже для быстрой отправки {request_text}:"
+                )
+                
+                combined_kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Встал", callback_data=f"vstal_{number_id}"),
+                     InlineKeyboardButton(text="❌ Слет / Отстоял", callback_data=f"slet_{number_id}")],
+                    [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{number_id}"),
+                     InlineKeyboardButton(text="⏭ Ошибка / Удалить", callback_data=f"err_{number_id}")],
+                    [InlineKeyboardButton(text="📤 Отправить повтор", callback_data=f"quick_resend_{number_id}_{user_id}_photo")]
+                ])
+                
+                await bot.edit_message_text(
+                    chat_id=saved_chat_id,
+                    message_id=saved_message_id,
+                    text=new_text,
+                    reply_markup=combined_kb,
+                    parse_mode="None"
+                )
+                edited_count += 1
+            except Exception as e:
+                logging.error(f"Ошибка редактирования сообщения оператора {saved_operator_id}: {e}")
+                try:
+                    await bot.send_message(
+                        saved_operator_id,
+                        f"🔄 **Пользователь запросил {request_text}!**\n\n"
+                        f"📱 Номер: `{safe_phone}`\n"
+                        f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
+                        f"Нажмите кнопку ниже для быстрой отправки {request_text}:",
+                        reply_markup=quick_reply_kb,
+                        parse_mode="None"
+                    )
+                    edited_count += 1
+                except Exception as e2:
+                    logging.error(f"Ошибка отправки сообщения оператору {saved_operator_id}: {e2}")
+    else:
+        # Сообщение не найдено, отправляем новое (fallback)
+        if admin_id:
+            admins_to_notify = [admin_id]
+        else:
+            admins = db.get_admins_list()
+            admins_to_notify = [a[0] for a in admins] + ADMIN_IDS
+        
+        admins_to_notify = list(set(admins_to_notify))
+        
+        for admin_id_item in admins_to_notify:
+            try:
+                await bot.send_message(
+                    admin_id_item,
+                    f"🔄 **Пользователь запросил {request_text}!**\n\n"
+                    f"📱 Номер: `{safe_phone}`\n"
+                    f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
+                    f"Нажмите кнопку ниже для быстрой отправки {request_text}:",
+                    reply_markup=quick_reply_kb,
+                    parse_mode="None"
+                )
+                edited_count += 1
+            except Exception as e:
             logging.error(f"Ошибка отправки оператору {admin_id}: {e}")
     
     # Уведомляем пользователя
@@ -5119,53 +5240,104 @@ async def qr_repeat_handler(callback: CallbackQuery, state: FSMContext):
     
     await callback.answer("✅ Запрос QR-кода отправлен оператору", show_alert=True)
     
-    # Получаем всех операторов для отправки уведомления
-    if admin_id:
-        # Отправляем конкретному оператору
-        admins_to_notify = [admin_id]
-    else:
-        # Отправляем всем операторам
-        admins = db.get_admins_list()
-        admins_to_notify = [a[0] for a in admins] + ADMIN_IDS
-    
-    # Удаляем дубликаты
-    admins_to_notify = list(set(admins_to_notify))
-    
-    # Отправляем уведомление операторам
+    # Подготовка данных
     safe_phone = escape_markdown(phone)
     safe_username = escape_markdown(username or f"ID{user_id}")
+    request_text = "QR-код"
     
     # Создаем клавиатуру для быстрого ответа (QR-код)
     quick_reply_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📱 Отправить QR", callback_data=f"send_qr_{number_id}_{user_id}")]
     ])
     
-    sent_count = 0
-    for admin_id in admins_to_notify:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"📱 **Пользователь запросил QR-код!**\n\n"
-                f"📞 Номер: `{safe_phone}`\n"
-                f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
-                f"Нажмите кнопку ниже для быстрой отправки QR-кода:",
-                reply_markup=quick_reply_kb,
-                parse_mode="None"
-            )
-            sent_count += 1
-        except Exception as e:
-            logging.error(f"Ошибка отправки оператору {admin_id}: {e}")
+    # Пытаемся найти и отредактировать существующее сообщение оператора
+    edited_count = 0
+    
+    if number_id in operator_number_messages:
+        saved_operator_id, saved_message_id, saved_chat_id = operator_number_messages[number_id]
+        
+        if admin_id is None or saved_operator_id == admin_id:
+            try:
+                number_prio_info = db.cursor.execute(
+                    "SELECT is_priority FROM numbers WHERE id = ?", (number_id,)
+                ).fetchone()
+                is_prio = number_prio_info[0] if number_prio_info else 0
+                _, p_name = db.get_priority_settings()
+                prio_label = f"⭐ [{p_name}] " if is_prio else ""
+                
+                original_text = f"{prio_label}📱 **Номер:** `{safe_phone}`\n👤 От: @{safe_username} (ID: `{user_id}`)"
+                new_text = (
+                    f"{original_text}\n\n"
+                    f"📱 **Пользователь запросил {request_text}!**\n\n"
+                    f"Нажмите кнопку ниже для быстрой отправки {request_text}:"
+                )
+                
+                combined_kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Встал", callback_data=f"vstal_{number_id}"),
+                     InlineKeyboardButton(text="❌ Слет / Отстоял", callback_data=f"slet_{number_id}")],
+                    [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{number_id}"),
+                     InlineKeyboardButton(text="⏭ Ошибка / Удалить", callback_data=f"err_{number_id}")],
+                    [InlineKeyboardButton(text="📱 Отправить QR", callback_data=f"send_qr_{number_id}_{user_id}")]
+                ])
+                
+                await bot.edit_message_text(
+                    chat_id=saved_chat_id,
+                    message_id=saved_message_id,
+                    text=new_text,
+                    reply_markup=combined_kb,
+                    parse_mode="None"
+                )
+                edited_count += 1
+            except Exception as e:
+                logging.error(f"Ошибка редактирования сообщения оператора {saved_operator_id}: {e}")
+                try:
+                    await bot.send_message(
+                        saved_operator_id,
+                        f"📱 **Пользователь запросил {request_text}!**\n\n"
+                        f"📱 Номер: `{safe_phone}`\n"
+                        f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
+                        f"Нажмите кнопку ниже для быстрой отправки {request_text}:",
+                        reply_markup=quick_reply_kb,
+                        parse_mode="None"
+                    )
+                    edited_count += 1
+                except Exception as e2:
+                    logging.error(f"Ошибка отправки сообщения оператору {saved_operator_id}: {e2}")
+    else:
+        # Сообщение не найдено, отправляем новое (fallback)
+        if admin_id:
+            admins_to_notify = [admin_id]
+        else:
+            admins = db.get_admins_list()
+            admins_to_notify = [a[0] for a in admins] + ADMIN_IDS
+        
+        admins_to_notify = list(set(admins_to_notify))
+        
+        for admin_id_item in admins_to_notify:
+            try:
+                await bot.send_message(
+                    admin_id_item,
+                    f"📱 **Пользователь запросил {request_text}!**\n\n"
+                    f"📱 Номер: `{safe_phone}`\n"
+                    f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
+                    f"Нажмите кнопку ниже для быстрой отправки {request_text}:",
+                    reply_markup=quick_reply_kb,
+                    parse_mode="None"
+                )
+                edited_count += 1
+            except Exception as e:
+                logging.error(f"Ошибка отправки оператору {admin_id_item}: {e}")
     
     # Уведомляем пользователя
-    if sent_count > 0:
+    if edited_count > 0:
         await callback.message.answer(
-            "📱 **Запрос на QR-код отправлен операторам!**\n\n"
+            "📱 **Запрос на QR-код отправлен оператору!**\n\n"
             "⏳ Ожидайте QR-код в ближайшее время.",
             parse_mode="None"
         )
     else:
         await callback.message.answer(
-            "❌ **Не удалось отправить запрос операторам**\n\n"
+            "❌ **Не удалось отправить запрос оператору**\n\n"
             "Пожалуйста, попробуйте позже.",
             parse_mode="None"
         )
@@ -5272,53 +5444,104 @@ async def repeat_photo_handler(callback: CallbackQuery, state: FSMContext):
     
     await callback.answer("✅ Запрос повтора фото отправлен оператору", show_alert=True)
     
-    # Получаем всех операторов для отправки уведомления
-    if admin_id:
-        # Отправляем конкретному оператору
-        admins_to_notify = [admin_id]
-    else:
-        # Отправляем всем операторам
-        admins = db.get_admins_list()
-        admins_to_notify = [a[0] for a in admins] + ADMIN_IDS
-    
-    # Удаляем дубликаты
-    admins_to_notify = list(set(admins_to_notify))
-    
-    # Отправляем уведомление операторам
+    # Подготовка данных
     safe_phone = escape_markdown(phone)
     safe_username = escape_markdown(username or f"ID{user_id}")
+    request_text = "повторное фото"
     
     # Создаем клавиатуру для быстрого ответа (фото)
     quick_reply_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📤 Отправить фото", callback_data=f"send_photo_{number_id}_{user_id}")]
     ])
     
-    sent_count = 0
-    for admin_id in admins_to_notify:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"🔄 **Пользователь запросил повторное фото!**\n\n"
-                f"📱 Номер: `{safe_phone}`\n"
-                f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
-                f"Нажмите кнопку ниже для быстрой отправки фото:",
-                reply_markup=quick_reply_kb,
-                parse_mode="None"
-            )
-            sent_count += 1
-        except Exception as e:
-            logging.error(f"Ошибка отправки оператору {admin_id}: {e}")
+    # Пытаемся найти и отредактировать существующее сообщение оператора
+    edited_count = 0
+    
+    if number_id in operator_number_messages:
+        saved_operator_id, saved_message_id, saved_chat_id = operator_number_messages[number_id]
+        
+        if admin_id is None or saved_operator_id == admin_id:
+            try:
+                number_prio_info = db.cursor.execute(
+                    "SELECT is_priority FROM numbers WHERE id = ?", (number_id,)
+                ).fetchone()
+                is_prio = number_prio_info[0] if number_prio_info else 0
+                _, p_name = db.get_priority_settings()
+                prio_label = f"⭐ [{p_name}] " if is_prio else ""
+                
+                original_text = f"{prio_label}📱 **Номер:** `{safe_phone}`\n👤 От: @{safe_username} (ID: `{user_id}`)"
+                new_text = (
+                    f"{original_text}\n\n"
+                    f"🔄 **Пользователь запросил {request_text}!**\n\n"
+                    f"Нажмите кнопку ниже для быстрой отправки фото:"
+                )
+                
+                combined_kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Встал", callback_data=f"vstal_{number_id}"),
+                     InlineKeyboardButton(text="❌ Слет / Отстоял", callback_data=f"slet_{number_id}")],
+                    [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{number_id}"),
+                     InlineKeyboardButton(text="⏭ Ошибка / Удалить", callback_data=f"err_{number_id}")],
+                    [InlineKeyboardButton(text="📤 Отправить фото", callback_data=f"send_photo_{number_id}_{user_id}")]
+                ])
+                
+                await bot.edit_message_text(
+                    chat_id=saved_chat_id,
+                    message_id=saved_message_id,
+                    text=new_text,
+                    reply_markup=combined_kb,
+                    parse_mode="None"
+                )
+                edited_count += 1
+            except Exception as e:
+                logging.error(f"Ошибка редактирования сообщения оператора {saved_operator_id}: {e}")
+                try:
+                    await bot.send_message(
+                        saved_operator_id,
+                        f"🔄 **Пользователь запросил {request_text}!**\n\n"
+                        f"📱 Номер: `{safe_phone}`\n"
+                        f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
+                        f"Нажмите кнопку ниже для быстрой отправки фото:",
+                        reply_markup=quick_reply_kb,
+                        parse_mode="None"
+                    )
+                    edited_count += 1
+                except Exception as e2:
+                    logging.error(f"Ошибка отправки сообщения оператору {saved_operator_id}: {e2}")
+    else:
+        # Сообщение не найдено, отправляем новое (fallback)
+        if admin_id:
+            admins_to_notify = [admin_id]
+        else:
+            admins = db.get_admins_list()
+            admins_to_notify = [a[0] for a in admins] + ADMIN_IDS
+        
+        admins_to_notify = list(set(admins_to_notify))
+        
+        for admin_id_item in admins_to_notify:
+            try:
+                await bot.send_message(
+                    admin_id_item,
+                    f"🔄 **Пользователь запросил {request_text}!**\n\n"
+                    f"📱 Номер: `{safe_phone}`\n"
+                    f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
+                    f"Нажмите кнопку ниже для быстрой отправки фото:",
+                    reply_markup=quick_reply_kb,
+                    parse_mode="None"
+                )
+                edited_count += 1
+            except Exception as e:
+                logging.error(f"Ошибка отправки оператору {admin_id_item}: {e}")
     
     # Уведомляем пользователя
-    if sent_count > 0:
+    if edited_count > 0:
         await callback.message.answer(
-            "🔄 **Запрос на повторное фото отправлен операторам!**\n\n"
+            "🔄 **Запрос на повторное фото отправлен оператору!**\n\n"
             "⏳ Ожидайте фото в ближайшее время.",
             parse_mode="None"
         )
     else:
         await callback.message.answer(
-            "❌ **Не удалось отправить запрос операторам**\n\n"
+            "❌ **Не удалось отправить запрос оператору**\n\n"
             "Пожалуйста, попробуйте позже.",
             parse_mode="None"
         )
@@ -5554,7 +5777,7 @@ async def send_photo_with_buttons(operator_id, user_id, phone, photo_id):
         ])
         
         # Отправляем оператору сообщение с кнопками
-        await bot.send_message(
+        sent_message = await bot.send_message(
             operator_id,
             f"✅ Фото отправлено пользователю ID {user_id}\n"
             f"📱 Номер: {escape_markdown(phone)}\n\n"
@@ -5562,6 +5785,8 @@ async def send_photo_with_buttons(operator_id, user_id, phone, photo_id):
             reply_markup=kb,
             parse_mode="None"
         )
+        # Сохраняем message_id для связи с номером
+        operator_number_messages[number_id] = (operator_id, sent_message.message_id, sent_message.chat.id)
 
 # ============================================
 # ОБРАБОТЧИКИ ВЫБОРА ТАРИФА И ВВОДА НОМЕРА
