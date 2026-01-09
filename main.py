@@ -1068,6 +1068,44 @@ class Database:
             ORDER BY n.id DESC LIMIT 15
         """, (user_id,)).fetchall()
 
+    def get_user_numbers_by_date(self, user_id, date_str=None, limit=None):
+        """Получить номера пользователя за определенную дату"""
+        if date_str:
+            query = """
+                SELECT n.phone, n.status, t.name, n.created_at, n.finished_at
+                FROM numbers n
+                LEFT JOIN tariffs t ON n.tariff_id = t.id
+                WHERE n.user_id = ? AND DATE(n.created_at) = ?
+                ORDER BY n.created_at DESC
+            """
+            if limit:
+                query += " LIMIT ?"
+                return self.cursor.execute(query, (user_id, date_str, limit)).fetchall()
+            return self.cursor.execute(query, (user_id, date_str)).fetchall()
+        else:
+            # Все номера пользователя
+            query = """
+                SELECT n.phone, n.status, t.name, n.created_at, n.finished_at
+                FROM numbers n
+                LEFT JOIN tariffs t ON n.tariff_id = t.id
+                WHERE n.user_id = ?
+                ORDER BY n.created_at DESC
+            """
+            if limit:
+                query += " LIMIT ?"
+                return self.cursor.execute(query, (user_id, limit)).fetchall()
+            return self.cursor.execute(query, (user_id,)).fetchall()
+
+    def get_user_available_dates(self, user_id):
+        """Получить список дат, за которые у пользователя есть номера"""
+        return self.cursor.execute("""
+            SELECT DISTINCT DATE(created_at) as date 
+            FROM numbers 
+            WHERE user_id = ? AND created_at IS NOT NULL 
+            ORDER BY date DESC
+            LIMIT 30
+        """, (user_id,)).fetchall()
+
     def get_all_numbers_raw(self):
         return self.cursor.execute("""
             SELECT n.id, n.phone, u.username, n.status, t.name, n.created_at, n.finished_at
@@ -1290,6 +1328,7 @@ class Form(StatesGroup):
     # Состояния для выбора даты
     waiting_for_date_selection = State()  # Выбор даты для просмотра базы
     waiting_for_download_date = State()   # Выбор даты для скачивания базы
+    waiting_for_user_date_selection = State()  # Выбор даты пользователем для архива
     # Состояние для повторной отправки фото
     waiting_for_repeat_reply = State()
 
@@ -1541,7 +1580,7 @@ async def withdraw_cmd(message: types.Message):
 
 @dp.message(Command("archive"))
 async def archive_cmd(message: types.Message):
-    """Команда /archive - показать архив номеров БЕЗ ВРЕМЕНИ"""
+    """Старый команда /archive - показать архив номеров БЕЗ ВРЕМЕНИ"""
     if db.is_user_banned(message.from_user.id): 
         return
     
@@ -1556,8 +1595,9 @@ async def archive_cmd(message: types.Message):
             emo = "✅" if status == "ОТСТОЯЛ" else "❌"
             text += f"{emo} `{phone}` | {tariff_name} | {status}\n"
     
-    # Добавляем кнопку "чат с отзывами"
+    # Добавляем кнопку для нового интерфейса с датами
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Смотреть по датам", callback_data="archive_dates")],
         [InlineKeyboardButton(text="💬 Чат с отзывами", url="https://t.me/magic_team_payments")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
     ])
@@ -1566,28 +1606,350 @@ async def archive_cmd(message: types.Message):
 
 @dp.callback_query(F.data == "archive")
 async def archive_button_handler(callback: CallbackQuery):
-    """Обработчик кнопки архива БЕЗ ВРЕМЕНИ"""
+    """Обработчик кнопки архива с выбором даты"""
     if db.is_user_banned(callback.from_user.id): 
         return
     
-    data = db.get_user_archive(callback.from_user.id)
+    await archive_cmd(types.Message(
+        chat=callback.message.chat,
+        from_user=callback.from_user
+    ))
+    await callback.message.delete()
+
+@dp.callback_query(F.data == "archive_dates")
+async def archive_dates_handler(callback: CallbackQuery):
+    """Переход к новому интерфейсу с датами"""
+    if db.is_user_banned(callback.from_user.id): 
+        return
     
-    if not data:
+    # Получаем список доступных дат для пользователя
+    available_dates = db.get_user_available_dates(callback.from_user.id)
+    
+    if not available_dates:
         text = "📂 **Архив пуст**\n\nУ вас пока нет завершенных номеров."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="archive")]
+        ])
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="None")
+        return
+    
+    text = "📂 **История номеров**\n\n"
+    text += "📅 Выберите дату для просмотра или действие:"
+    
+    buttons = []
+    
+    # Показываем последние 5 дат
+    for i, (date_str,) in enumerate(available_dates[:5]):
+        try:
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+            formatted_date = date_obj.strftime('%d.%m.%Y')
+            # Считаем количество номеров за эту дату
+            count = len(db.get_user_numbers_by_date(callback.from_user.id, date_str))
+            button_text = f"📅 {formatted_date} ({count})"
+        except:
+            button_text = f"📅 {date_str}"
+        
+        buttons.append([InlineKeyboardButton(
+            text=button_text, 
+            callback_data=f"user_view_date_{date_str}"
+        )])
+    
+    # Кнопка "Все номера"
+    all_count = db.cursor.execute(
+        "SELECT COUNT(*) FROM numbers WHERE user_id = ?",
+        (callback.from_user.id,)
+    ).fetchone()[0]
+    buttons.append([InlineKeyboardButton(
+        text=f"📋 Все номера ({all_count})", 
+        callback_data="user_view_all"
+    )])
+    
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="archive")])
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+@dp.callback_query(F.data.startswith("user_view_date_"))
+async def user_view_date_handler(callback: CallbackQuery):
+    """Показать номера пользователя за определенную дату"""
+    if db.is_user_banned(callback.from_user.id): 
+        return
+    
+    date_str = callback.data.split("user_view_date_")[1]
+    
+    try:
+        # Форматируем дату для отображения
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        formatted_date = date_obj.strftime('%d.%m.%Y')
+    except:
+        formatted_date = date_str
+    
+    # Получаем все номера за эту дату
+    numbers = db.get_user_numbers_by_date(callback.from_user.id, date_str)
+    
+    if not numbers:
+        text = f"📭 **Нет номеров за {formatted_date}**"
+        buttons = [
+            [InlineKeyboardButton(text="⬅️ Назад к выбору даты", callback_data="archive")]
+        ]
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+        return
+    
+    # Если номеров больше 15, предлагаем скачать файл
+    if len(numbers) > 15:
+        text = f"📂 **Ваши номера за {formatted_date}**\n\n"
+        text += f"📊 **Всего номеров:** {len(numbers)}\n"
+        text += "⚠️ **Слишком много номеров для отображения в чате.**\n\n"
+        text += "📥 **Скачайте файл для просмотра всех номеров:**"
+        
+        buttons = [
+            [InlineKeyboardButton(text="📥 Скачать файл (.txt)", callback_data=f"user_download_date_{date_str}")],
+            [InlineKeyboardButton(text="⬅️ Назад к выбору даты", callback_data="archive")]
+        ]
     else:
-        text = "📂 **История номеров** (последние 15):\n\n"
-        for row in data:
-            phone, status, tariff_name = row  # Распаковываем 3 элемента
-            emo = "✅" if status == "ОТСТОЯЛ" else "❌"
-            text += f"{emo} `{phone}` | {tariff_name} | {status}\n"
+        # Считаем статистику
+        total = len(numbers)
+        success_count = sum(1 for n in numbers if n[1] == "ОТСТОЯЛ")
+        fail_count = sum(1 for n in numbers if n[1] == "СЛЕТ")
+        
+        text = f"📂 **Ваши номера за {formatted_date}**\n\n"
+        text += f"📊 **Статистика:**\n"
+        text += f"• Всего номеров: {total}\n"
+        text += f"• Отстояли: {success_count}\n"
+        text += f"• Слетели: {fail_count}\n\n"
+        
+        text += "📋 **Список номеров:**\n\n"
+        
+        for i, n in enumerate(numbers, 1):
+            phone, status, tariff_name, created_at, finished_at = n
+            safe_phone = escape_markdown(phone)
+            
+            if status == "ОТСТОЯЛ":
+                emoji = "✅"
+                status_text = "ОТСТОЯЛ"
+            else:
+                emoji = "❌"
+                status_text = "СЛЕТ"
+            
+            text += f"{emoji} **{i}. {safe_phone}**\n"
+            text += f"   📱 Тариф: {tariff_name}\n"
+            text += f"   📊 Статус: {status_text}\n\n"  # Убрано время
+        
+        buttons = [
+            [InlineKeyboardButton(text="📥 Скачать полный список (.txt)", callback_data=f"user_download_date_{date_str}")],
+            [InlineKeyboardButton(text="⬅️ Назад к выбору даты", callback_data="archive")]
+        ]
     
-    # Добавляем кнопку "чат с отзывами"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Чат с отзывами", url="https://t.me/magic_team_payments")],
-        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
-    ])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+@dp.callback_query(F.data == "user_view_all")
+async def user_view_all_handler(callback: CallbackQuery):
+    """Показать все номера пользователя"""
+    if db.is_user_banned(callback.from_user.id): 
+        return
     
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="None")
+    # Получаем все номера (ограничиваем для показа)
+    numbers = db.get_user_numbers_by_date(callback.from_user.id, limit=15)
+    all_numbers = db.get_user_numbers_by_date(callback.from_user.id)
+    
+    if not numbers:
+        text = "📭 **У вас пока нет номеров**"
+        buttons = [
+            [InlineKeyboardButton(text="⬅️ Назад к выбору даты", callback_data="archive")]
+        ]
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+        return
+    
+    # Если номеров больше 15, предлагаем скачать файл
+    if len(all_numbers) > 15:
+        text = "📂 **Все ваши номера**\n\n"
+        text += f"📊 **Всего номеров:** {len(all_numbers)}\n"
+        text += "⚠️ **Слишком много номеров для отображения в чате.**\n\n"
+        text += "📥 **Скачайте файл для просмотра всех номеров:**"
+        
+        buttons = [
+            [InlineKeyboardButton(text="📥 Скачать файл (.txt)", callback_data="user_download_all")],
+            [InlineKeyboardButton(text="⬅️ Назад к выбору даты", callback_data="archive")]
+        ]
+    else:
+        # Считаем статистику
+        total = len(all_numbers)
+        success_count = sum(1 for n in all_numbers if n[1] == "ОТСТОЯЛ")
+        fail_count = sum(1 for n in all_numbers if n[1] == "СЛЕТ")
+        
+        text = "📂 **Все ваши номера**\n\n"
+        text += f"📊 **Статистика:**\n"
+        text += f"• Всего номеров: {total}\n"
+        text += f"• Отстояли: {success_count}\n"
+        text += f"• Слетели: {fail_count}\n\n"
+        
+        text += "📋 **Последние 15 номеров:**\n\n"
+        
+        for i, n in enumerate(numbers, 1):
+            phone, status, tariff_name, created_at, finished_at = n
+            safe_phone = escape_markdown(phone)
+            
+            if status == "ОТСТОЯЛ":
+                emoji = "✅"
+                status_text = "ОТСТОЯЛ"
+            else:
+                emoji = "❌"
+                status_text = "СЛЕТ"
+            
+            # Убрано отображение даты и времени
+            text += f"{emoji} **{i}. {safe_phone}**\n"
+            text += f"   📱 Тариф: {tariff_name}\n"
+            text += f"   📊 Статус: {status_text}\n\n"  # Убрано дату и время
+        
+        buttons = [
+            [InlineKeyboardButton(text="📥 Скачать полный список (.txt)", callback_data="user_download_all")],
+            [InlineKeyboardButton(text="⬅️ Назад к выбору даты", callback_data="archive")]
+        ]
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+@dp.callback_query(F.data.startswith("user_download_date_"))
+async def user_download_date_handler(callback: CallbackQuery):
+    """Скачать номера пользователя за определенную дату"""
+    if db.is_user_banned(callback.from_user.id): 
+        return
+    
+    date_str = callback.data.split("user_download_date_")[1]
+    
+    try:
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        formatted_date = date_obj.strftime('%d.%m.%Y')
+        file_date = date_obj.strftime('%Y-%m-%d')
+    except:
+        formatted_date = date_str
+        file_date = date_str
+    
+    # Получаем номера за дату
+    numbers = db.get_user_numbers_by_date(callback.from_user.id, date_str)
+    
+    if not numbers:
+        await callback.answer("📭 Нет номеров для скачивания", show_alert=True)
+        return
+    
+    # Создаем файл
+    filename = f"numbers_{callback.from_user.id}_{file_date}.txt"
+    
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write("=" * 60 + "\n")
+        f.write(f"ВАШИ НОМЕРА ЗА {formatted_date}\n")
+        f.write(f"Дата экспорта: {datetime.now().strftime('%d.%m.%Y')}\n")
+        f.write(f"Всего номеров: {len(numbers)}\n")
+        f.write("=" * 60 + "\n\n")
+        
+        # Статистика
+        success_count = sum(1 for n in numbers if n[1] == "ОТСТОЯЛ")
+        fail_count = sum(1 for n in numbers if n[1] == "СЛЕТ")
+        
+        f.write(f"СТАТИСТИКА:\n")
+        f.write(f"  Всего номеров: {len(numbers)}\n")
+        f.write(f"  Отстояли: {success_count}\n")
+        f.write(f"  Слетели: {fail_count}\n")
+        f.write("-" * 60 + "\n\n")
+        
+        # Список номеров БЕЗ ВРЕМЕНИ
+        f.write("СПИСОК НОМЕРОВ:\n\n")
+        f.write(f"{'№':<3} {'Номер':<15} {'Тариф':<15} {'Статус':<10}\n")
+        f.write("-" * 45 + "\n")
+        
+        for i, n in enumerate(numbers, 1):
+            phone, status, tariff_name, created_at, finished_at = n
+            f.write(f"{i:<3} {phone:<15} {tariff_name:<15} {status:<10}\n")
+    
+    try:
+        # Отправляем файл
+        await callback.message.answer_document(
+            FSInputFile(filename),
+            caption=f"📂 **Ваши номера за {formatted_date}**\n\n"
+                   f"📊 Всего номеров: {len(numbers)}\n"
+                   f"📅 Дата: {formatted_date}",
+            parse_mode="None"
+        )
+        await callback.answer("✅ Файл отправлен")
+    except Exception as e:
+        await callback.answer(f"❌ Ошибка отправки файла", show_alert=True)
+    finally:
+        # Удаляем временный файл
+        if os.path.exists(filename):
+            os.remove(filename)
+
+@dp.callback_query(F.data == "user_download_all")
+async def user_download_all_handler(callback: CallbackQuery):
+    """Скачать все номера пользователя"""
+    if db.is_user_banned(callback.from_user.id): 
+        return
+    
+    # Получаем все номера
+    numbers = db.get_user_numbers_by_date(callback.from_user.id)
+    
+    if not numbers:
+        await callback.answer("📭 Нет номеров для скачивания", show_alert=True)
+        return
+    
+    # Создаем файл
+    filename = f"numbers_{callback.from_user.id}_all.txt"
+    
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write("=" * 60 + "\n")
+        f.write("ВСЕ ВАШИ НОМЕРА\n")
+        f.write(f"Дата экспорта: {datetime.now().strftime('%d.%m.%Y')}\n")
+        f.write(f"Всего номеров: {len(numbers)}\n")
+        f.write("=" * 60 + "\n\n")
+        
+        # Статистика
+        success_count = sum(1 for n in numbers if n[1] == "ОТСТОЯЛ")
+        fail_count = sum(1 for n in numbers if n[1] == "СЛЕТ")
+        
+        f.write(f"СТАТИСТИКА:\n")
+        f.write(f"  Всего номеров: {len(numbers)}\n")
+        f.write(f"  Отстояли: {success_count}\n")
+        f.write(f"  Слетели: {fail_count}\n")
+        f.write("-" * 60 + "\n\n")
+        
+        # Список номеров по датам (без времени)
+        dates = {}
+        for n in numbers:
+            phone, status, tariff_name, created_at, finished_at = n
+            date_str = created_at.split()[0] if created_at else "Неизвестно"
+            if date_str not in dates:
+                dates[date_str] = []
+            dates[date_str].append((phone, status, tariff_name))
+        
+        for date_str, date_numbers in sorted(dates.items(), reverse=True):
+            try:
+                date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+                formatted_date = date_obj.strftime('%d.%m.%Y')
+            except:
+                formatted_date = date_str
+            
+            f.write(f"\n📅 ДАТА: {formatted_date} ({len(date_numbers)} номеров)\n")
+            f.write("-" * 50 + "\n")
+            
+            for i, n in enumerate(date_numbers, 1):
+                phone, status, tariff_name = n  # Убрано время
+                f.write(f"  {i}. {phone} | {tariff_name} | {status}\n")
+            
+            f.write("\n")
+    
+    try:
+        # Отправляем файл
+        await callback.message.answer_document(
+            FSInputFile(filename),
+            caption=f"📂 **Все ваши номера**\n\n"
+                   f"📊 Всего номеров: {len(numbers)}\n"
+                   f"📅 Дата экспорта: {datetime.now().strftime('%d.%m.%Y')}",
+            parse_mode="None"
+        )
+        await callback.answer("✅ Файл отправлен")
+    except Exception as e:
+        await callback.answer(f"❌ Ошибка отправки файла", show_alert=True)
+    finally:
+        # Удаляем временный файл
+        if os.path.exists(filename):
+            os.remove(filename)
 
 @dp.message(Command("queue"))
 async def queue_cmd(message: types.Message):
