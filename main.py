@@ -4615,19 +4615,23 @@ async def reply_send_handler(message: types.Message, state: FSMContext):
             # Если отправлено фото
             photo = message.photo[-1]
             
-            # Создаем callback_data для кнопок "Повтор" и "Куар"
-            callback_photo = create_repeat_callback(number_id, user_id, request_type="photo")
-            callback_qr = create_repeat_callback(number_id, user_id, request_type="qr")
+            # Создаем кнопки только если есть number_id
+            repeat_kb = None
+            if number_id:
+                # Создаем callback_data для кнопок "Повтор" и "Куар"
+                # user_id здесь - это ID оператора, который отправляет сообщение
+                callback_photo = create_repeat_callback(number_id, admin_id=user_id, request_type="photo")
+                callback_qr = create_repeat_callback(number_id, admin_id=user_id, request_type="qr")
+                
+                # Создаем клавиатуру с двумя кнопками
+                repeat_kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="🔄 Повтор", callback_data=callback_photo),
+                        InlineKeyboardButton(text="📱 Куар", callback_data=callback_qr)
+                    ]
+                ])
             
-            # Создаем клавиатуру с двумя кнопками
-            repeat_kb = InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="🔄 Повтор", callback_data=callback_photo),
-                    InlineKeyboardButton(text="📱 Куар", callback_data=callback_qr)
-                ]
-            ])
-            
-            # Отправляем фото пользователю с кнопками
+            # Отправляем фото пользователю с кнопками (если они есть)
             await bot.send_photo(
                 user_id_to_reply,
                 photo.file_id,
@@ -4664,7 +4668,7 @@ def create_repeat_callback(number_id, admin_id=None, request_type="photo"):
         admin_id: ID оператора (опционально)
         request_type: тип запроса - "photo" или "qr"
     """
-    callback_parts = ["repeat", request_type, str(number_id)]
+    callback_parts = ["simple_repeat", request_type, str(number_id)]
     if admin_id:
         callback_parts.append(str(admin_id))
     
@@ -4673,7 +4677,7 @@ def create_repeat_callback(number_id, admin_id=None, request_type="photo"):
 # Обработчик для кнопки "Повтор" у пользователя
 @dp.callback_query(F.data.startswith("simple_repeat_"))
 async def simple_repeat_handler(callback: CallbackQuery, state: FSMContext):
-    """Пользователь нажал кнопку 'Повтор'"""
+    """Пользователь нажал кнопку 'Повтор' или 'Куар'"""
     user_id = callback.from_user.id
     
     if db.is_user_banned(user_id):
@@ -4681,17 +4685,25 @@ async def simple_repeat_handler(callback: CallbackQuery, state: FSMContext):
         return
     
     # Получаем данные из callback_data
+    # Формат: simple_repeat_{type}_{number_id}_{admin_id}
     parts = callback.data.split("_")
-    if len(parts) < 3:
+    if len(parts) < 4:  # Должно быть как минимум 4 части: simple, repeat, type, number_id
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
     
     try:
-        # parts[0] = "repeat", parts[1] = "photo", parts[2] = number_id, parts[3] = admin_id (опционально)
-        number_id = int(parts[2])
-        admin_id = int(parts[3]) if len(parts) > 3 else None
-    except (ValueError, IndexError):
+        # parts[0] = "simple", parts[1] = "repeat", parts[2] = "photo"/"qr", parts[3] = number_id, parts[4] = admin_id (опционально)
+        request_type = parts[2]  # "photo" или "qr"
+        number_id = int(parts[3])
+        admin_id = int(parts[4]) if len(parts) > 4 else None
+        
+        # Проверяем валидность типа запроса
+        if request_type not in ["photo", "qr"]:
+            await callback.answer("❌ Неверный тип запроса", show_alert=True)
+            return
+    except (ValueError, IndexError) as e:
         await callback.answer("❌ Ошибка формата данных", show_alert=True)
+        logging.error(f"Ошибка парсинга callback_data {callback.data}: {e}")
         return
     
     # Получаем информацию о номере
@@ -4711,13 +4723,14 @@ async def simple_repeat_handler(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Это не ваш номер", show_alert=True)
         return
     
-    # Удаляем кнопку "Повтор" у пользователя
+    # Удаляем кнопки у пользователя
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except:
         pass
     
-    await callback.answer("✅ Запрос повтора отправлен оператору", show_alert=True)
+    request_text = "фото" if request_type == "photo" else "QR-код"
+    await callback.answer(f"✅ Запрос {request_text} отправлен оператору", show_alert=True)
     
     # Получаем всех операторов для отправки уведомления
     if admin_id:
@@ -4735,32 +4748,32 @@ async def simple_repeat_handler(callback: CallbackQuery, state: FSMContext):
     safe_phone = escape_markdown(phone)
     safe_username = escape_markdown(username or f"ID{user_id}")
     
-    # Создаем клавиатуру для быстрого ответа
+    # Создаем клавиатуру для быстрого ответа с указанием типа запроса
     quick_reply_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Отправить повтор", callback_data=f"quick_resend_{number_id}_{user_id}")]
+        [InlineKeyboardButton(text="📤 Отправить повтор", callback_data=f"quick_resend_{number_id}_{user_id}_{request_type}")]
     ])
     
     sent_count = 0
-    for admin_id in admins_to_notify:
+    for admin_id_item in admins_to_notify:
         try:
             await bot.send_message(
-                admin_id,
-                f"🔄 **Пользователь запросил повтор!**\n\n"
+                admin_id_item,
+                f"🔄 **Пользователь запросил {request_text}!**\n\n"
                 f"📱 Номер: `{safe_phone}`\n"
                 f"👤 Пользователь: @{safe_username} (ID: `{user_id}`)\n\n"
-                f"Нажмите кнопку ниже для быстрой отправки повторного фото:",
+                f"Нажмите кнопку ниже для быстрой отправки {request_text}:",
                 reply_markup=quick_reply_kb,
                 parse_mode="None"
             )
             sent_count += 1
         except Exception as e:
-            logging.error(f"Ошибка отправки оператору {admin_id}: {e}")
+            logging.error(f"Ошибка отправки оператору {admin_id_item}: {e}")
     
     # Уведомляем пользователя
     if sent_count > 0:
         await callback.message.answer(
-            "🔄 **Запрос на повтор отправлен операторам!**\n\n"
-            "⏳ Ожидайте повторной отправки фото в ближайшее время.",
+            f"🔄 **Запрос на {request_text} отправлен операторам!**\n\n"
+            "⏳ Ожидайте повторной отправки в ближайшее время.",
             parse_mode="None"
         )
     else:
@@ -4872,22 +4885,29 @@ async def repeat_handler(callback: CallbackQuery, state: FSMContext):
 # Обработчик для быстрой повторной отправки оператором
 @dp.callback_query(F.data.startswith("quick_resend_"))
 async def quick_resend_handler(callback: CallbackQuery, state: FSMContext):
-    """Оператор нажал 'Отправить повтор'"""
+    """Оператор нажал кнопку быстрой отправки повторного фото/QR"""
     user_id = callback.from_user.id
     if user_id not in ADMIN_IDS and not db.is_admin(user_id):
         await callback.answer("❌ У вас нет прав доступа", show_alert=True)
         return
     
     parts = callback.data.split("_")
-    if len(parts) < 4:
+    if len(parts) < 5:
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
     
     try:
+        # Формат: quick_resend_{number_id}_{target_user_id}_{request_type}
         number_id = int(parts[2])
         target_user_id = int(parts[3])
-    except ValueError:
+        request_type = parts[4] if len(parts) > 4 else "photo"
+        
+        # Проверяем валидность типа запроса
+        if request_type not in ["photo", "qr"]:
+            request_type = "photo"
+    except (ValueError, IndexError) as e:
         await callback.answer("❌ Ошибка формата данных", show_alert=True)
+        logging.error(f"Ошибка парсинга callback_data {callback.data}: {e}")
         return
     
     # Получаем информацию о номере
@@ -4902,21 +4922,27 @@ async def quick_resend_handler(callback: CallbackQuery, state: FSMContext):
     
     phone = number_info[0]
     
-    # Запрашиваем фото у оператора
+    # Определяем, это запрос QR или фото
+    is_qr_request = (request_type == "qr")
+    request_text = "QR-код" if is_qr_request else "фото"
+    
+    # Сохраняем данные в состояние для отправки медиа
     await state.update_data(
+        reply_to_user_id=target_user_id,
         target_user_id=target_user_id,
         phone=phone,
         number_id=number_id,
-        is_qr_request=False
+        request_type=request_type,
+        is_qr_request=is_qr_request
     )
     await state.set_state(Form.waiting_for_repeat_reply)
     
     safe_phone = escape_markdown(phone)
     await callback.message.edit_text(
-        f"📤 **Отправка повторного фото**\n\n"
+        f"📤 **Отправка {request_text} пользователю**\n\n"
         f"📱 Номер: `{safe_phone}`\n"
         f"👤 Получатель: ID `{target_user_id}`\n\n"
-        f"Отправьте фото для повторной отправки:",
+        f"Отправьте {request_text} для пользователя (фото, изображение QR-кода и т.д.):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_resend")]
         ]),
@@ -5315,10 +5341,31 @@ async def repeat_photo_send_handler(message: types.Message, state: FSMContext):
     
     try:
         photo = message.photo[-1]
-        target_user_id = data['target_user_id']
-        phone = data['phone']
-        number_id = data['number_id']
-        is_qr_request = data.get('is_qr_request', False)
+        # Может быть target_user_id или reply_to_user_id
+        target_user_id = data.get('target_user_id') or data.get('reply_to_user_id')
+        if not target_user_id:
+            await message.answer("❌ Ошибка: не найден получатель")
+            await state.clear()
+            return
+        
+        phone = data.get('phone')
+        number_id = data.get('number_id')
+        
+        # Если phone отсутствует, получаем из базы данных
+        if not phone and number_id:
+            number_info = db.cursor.execute(
+                "SELECT phone FROM numbers WHERE id = ?",
+                (number_id,)
+            ).fetchone()
+            if number_info:
+                phone = number_info[0]
+        
+        if not phone:
+            phone = "неизвестен"
+        
+        # Получаем тип запроса из состояния или определяем по is_qr_request
+        request_type = data.get('request_type', 'qr' if data.get('is_qr_request', False) else 'photo')
+        is_qr_request = (request_type == 'qr') or data.get('is_qr_request', False)
         
         safe_phone = escape_markdown(phone)
         
@@ -5343,19 +5390,22 @@ async def repeat_photo_send_handler(message: types.Message, state: FSMContext):
             parse_mode="None"
         )
         
-        # Создаем новые кнопки для пользователя
-        callback_photo = create_repeat_callback(number_id, user_id, request_type="photo")
-        callback_qr = create_repeat_callback(number_id, user_id, request_type="qr")
+        # Создаем новые кнопки для пользователя только если есть number_id
+        repeat_kb = None
+        if number_id:
+            # user_id здесь - это ID оператора, который отправляет сообщение
+            callback_photo = create_repeat_callback(number_id, admin_id=user_id, request_type="photo")
+            callback_qr = create_repeat_callback(number_id, admin_id=user_id, request_type="qr")
+            
+            # Клавиатура с двумя кнопками
+            repeat_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🔄 Повтор", callback_data=callback_photo),
+                    InlineKeyboardButton(text="📱 Куар", callback_data=callback_qr)
+                ]
+            ])
         
-        # Клавиатура с двумя кнопками
-        repeat_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🔄 Повтор", callback_data=callback_photo),
-                InlineKeyboardButton(text="📱 Куар", callback_data=callback_qr)
-            ]
-        ])
-        
-        # Отправляем пользователю сообщение с кнопками
+        # Отправляем пользователю сообщение с кнопками (если они есть)
         await bot.send_message(
             target_user_id,
             user_message,
