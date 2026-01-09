@@ -1610,11 +1610,30 @@ async def archive_button_handler(callback: CallbackQuery):
     if db.is_user_banned(callback.from_user.id): 
         return
     
-    await archive_cmd(types.Message(
-        chat=callback.message.chat,
-        from_user=callback.from_user
-    ))
-    await callback.message.delete()
+    # Убираем удаление сообщения и используем edit_text вместо создания нового
+    await callback.answer()  # Подтверждаем нажатие
+    
+    data = db.get_user_archive(callback.from_user.id)
+    
+    if not data:
+        text = "📂 **Архив пуст**\n\nУ вас пока нет завершенных номеров."
+    else:
+        text = "📂 **История номеров** (последние 15):\n\n"
+        for row in data:
+            phone, status, tariff_name = row  # Распаковываем 3 элемента
+            emo = "✅" if status == "ОТСТОЯЛ" else "❌"
+            safe_phone = escape_markdown(phone)
+            text += f"{emo} `{safe_phone}` | {tariff_name} | {status}\n"
+    
+    # Добавляем кнопку для нового интерфейса с датами
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Смотреть по датам", callback_data="archive_dates")],
+        [InlineKeyboardButton(text="💬 Чат с отзывами", url="https://t.me/magic_team_payments")],
+        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
+    ])
+    
+    # Редактируем текущее сообщение вместо создания нового
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="None")
 
 @dp.callback_query(F.data == "archive_dates")
 async def archive_dates_handler(callback: CallbackQuery):
