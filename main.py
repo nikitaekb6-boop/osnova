@@ -3434,7 +3434,14 @@ async def csv_handler_general(callback: CallbackQuery, date_str=None):
     
     # Получаем данные в зависимости от фильтра
     if date_str:
-        data = db.get_all_numbers_by_date_raw(date_str)
+        data = db.cursor.execute("""
+            SELECT n.id, n.phone, u.username, n.status, t.name, n.created_at, n.finished_at, n.is_priority
+            FROM numbers n 
+            LEFT JOIN users u ON n.user_id = u.user_id
+            LEFT JOIN tariffs t ON n.tariff_id = t.id
+            WHERE DATE(n.created_at) = ?
+            ORDER BY n.created_at DESC
+        """, (date_str,)).fetchall()
         try:
             date_obj = datetime.strptime(date_str, '%Y-%m-%d')
             formatted_date = date_obj.strftime('%d.%m.%Y')
@@ -3446,7 +3453,13 @@ async def csv_handler_general(callback: CallbackQuery, date_str=None):
         filename = f"base_{file_date}.txt"
         caption = f"📂 **База номеров за {formatted_date}**\n\n📊 Всего номеров: {len(data)}"
     else:
-        data = db.get_all_numbers_raw()
+        data = db.cursor.execute("""
+            SELECT n.id, n.phone, u.username, n.status, t.name, n.created_at, n.finished_at, n.is_priority
+            FROM numbers n 
+            LEFT JOIN users u ON n.user_id = u.user_id
+            LEFT JOIN tariffs t ON n.tariff_id = t.id
+            ORDER BY n.created_at DESC
+        """).fetchall()
         today = datetime.now().strftime('%Y-%m-%d')
         filename = f"base_all_{today}.txt"
         caption = f"📂 **Полная база номеров**\n\n📊 Всего номеров: {len(data)}"
@@ -3457,7 +3470,7 @@ async def csv_handler_general(callback: CallbackQuery, date_str=None):
     
     path = filename
     with open(path, "w", encoding="utf-8") as f:
-        f.write("=" * 80 + "\n")
+        f.write("=" * 90 + "\n")
         
         if date_str:
             f.write(f"БАЗА НОМЕРОВ ЗА {formatted_date}\n")
@@ -3466,14 +3479,14 @@ async def csv_handler_general(callback: CallbackQuery, date_str=None):
         
         f.write(f"Дата экспорта: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Всего записей: {len(data)}\n")
-        f.write("=" * 80 + "\n\n")
+        f.write("=" * 90 + "\n\n")
         
-        f.write(f"{'ID':<6} {'Номер':<15} {'Пользователь':<25} {'Статус':<12} {'Тариф':<15} {'Создан':<20} {'Завершен':<20}\n")
-        f.write("-" * 120 + "\n")
+        f.write(f"{'ID':<6} {'Номер':<15} {'Пользователь':<25} {'Статус':<12} {'Тариф':<15} {'Приоритет':<10} {'Создан':<20} {'Завершен':<20}\n")
+        f.write("-" * 130 + "\n")
         
         for row in data:
-            # row содержит: id, phone, username, status, tariff_name, created_at, finished_at
-            row_id, phone, username, status, tariff_name, created_at, finished_at = row
+            # row содержит: id, phone, username, status, tariff_name, created_at, finished_at, is_priority
+            row_id, phone, username, status, tariff_name, created_at, finished_at, is_priority = row
             
             # Обрезаем длинные имена пользователей
             username_display = username or "—"
@@ -3484,7 +3497,10 @@ async def csv_handler_general(callback: CallbackQuery, date_str=None):
             created_display = created_at if created_at else "—"
             finished_display = finished_at if finished_at else "—"
             
-            f.write(f"{row_id:<6} {phone:<15} @{username_display:<24} {status:<12} {tariff_name:<15} {created_display:<20} {finished_display:<20}\n")
+            # Определяем приоритет
+            priority_text = "ДА" if is_priority else "НЕТ"
+            
+            f.write(f"{row_id:<6} {phone:<15} @{username_display:<24} {status:<12} {tariff_name:<15} {priority_text:<10} {created_display:<20} {finished_display:<20}\n")
     
     try:
         await callback.message.answer_document(
