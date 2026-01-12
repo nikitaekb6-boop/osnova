@@ -1633,7 +1633,7 @@ async def archive_button_handler(callback: CallbackQuery):
     # Добавляем кнопку для нового интерфейса с датами
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📅 Смотреть по датам", callback_data="archive_dates")],
-        [InlineKeyboardButton(text="💬 Чат с отзывами", url="https://t.me/magic_team_payments")],
+        [InlineKeyboardButton(text="💬 Чат с отзывами", url="https://t.me/+i2Agn48UehQ0Yzg6")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
     ])
     
@@ -4134,7 +4134,7 @@ async def process_withdrawal_comment(message: types.Message, state: FSMContext):
                         )
                         
                         kb = InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text="💬 Чат с отзывами", url="https://t.me/magic_team_payments")]
+                            [InlineKeyboardButton(text="💬 Чат с отзывами", url="https://t.me/+i2Agn48UehQ0Yzg6")]
                         ])
                         
                         await bot.send_message(PAYMENT_LOG_CHANNEL, log_text, reply_markup=kb, parse_mode="Markdown")
@@ -7248,4 +7248,5 @@ async def main():
 if __name__ == "__main__":
 
     asyncio.run(main())
+
 
