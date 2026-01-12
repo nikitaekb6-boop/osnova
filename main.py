@@ -2971,7 +2971,7 @@ async def restore_number_menu(number_id, operator_id=None):
 
 @dp.message(Command("number"))
 async def number_cmd(message: types.Message):
-    """Команда /number - взять следующий номер из очереди"""
+    """Команда /number - взять следующий номер из очереди С БЛОКИРОВКОЙ"""
     user_id = message.from_user.id
     
     # Проверяем права: супер-админ или оператор
@@ -2979,12 +2979,39 @@ async def number_cmd(message: types.Message):
         await message.answer("❌ У вас нет прав доступа к этой команде.")
         return
     
+    # Очищаем истекшие блокировки
+    db.clear_expired_locks()
+    
     number = db.get_next_number_from_queue()
     if not number:
         await message.answer("📭 **Очередь пуста.**", parse_mode="None")
         return
 
     n_id, phone, u_id, username, is_prio = number
+    
+    # Проверяем блокировку номера
+    locked_by = db.is_number_locked(n_id)
+    if locked_by and locked_by != user_id:
+        await message.answer(f"⚠️ Этот номер уже взят оператором ID: {locked_by}", parse_mode="None")
+        return
+    
+    # Проверяем существование пользователя
+    current_status = db.cursor.execute(
+        "SELECT status FROM numbers WHERE id = ?", 
+        (n_id,)
+    ).fetchone()
+    
+    if current_status and current_status[0] != 'Ожидание':
+        await message.answer("⚠️ Этот номер уже обработан другим оператором!", parse_mode="None")
+        return
+    
+    # Блокируем номер для текущего оператора
+    lock_success, lock_message = db.lock_number_for_admin(n_id, user_id)
+    if not lock_success:
+        await message.answer(lock_message, parse_mode="None")
+        return
+    
+    # Создаем клавиатуру
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Встал", callback_data=f"vstal_{n_id}"),
          InlineKeyboardButton(text="❌ Слет / Отстоял", callback_data=f"slet_{n_id}")],
