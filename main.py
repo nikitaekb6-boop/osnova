@@ -307,6 +307,12 @@ class Database:
             """)
         except:
             pass
+        
+        # Добавляем поле real_status для сохранения реального статуса
+        try:
+            self.cursor.execute("ALTER TABLE numbers ADD COLUMN real_status TEXT DEFAULT NULL")
+        except:
+            pass
 
     # РЕФЕРАЛЬНАЯ СИСТЕМА
     def get_referral_bonus(self):
@@ -374,10 +380,10 @@ class Database:
             
             referrer_id = referrer[0]
             
-            # Проверяем, есть ли успешный номер у пользователя (ОТСТОЯЛ)
+            # Проверяем, есть ли успешный номер у пользователя по REAL_STATUS (с учетом скрытой надбавки)
             successful_number = self.cursor.execute("""
                 SELECT COUNT(*) FROM numbers 
-                WHERE user_id = ? AND status = 'ОТСТОЯЛ'
+                WHERE user_id = ? AND real_status = 'ОТСТОЯЛ'  # <-- Используем real_status!
             """, (user_id,)).fetchone()
             
             if successful_number and successful_number[0] > 0:
@@ -590,7 +596,7 @@ class Database:
             # Для пользователей показываем только стандартное время
             return standard_duration, 0
 
-    def set_number_slet(self, number_id, is_admin=False):
+    def set_number_slet(self, number_id, operator_id):
         """Завершить работу с номером с учетом скрытой надбавки времени"""
         with self.connection:
             res = self.cursor.execute("""
@@ -610,97 +616,66 @@ class Database:
             # Получаем скрытую надбавку
             hidden_bonus = self.get_hidden_time_bonus(tariff_id)
             
-            # РЕАЛЬНОЕ время для проверки
+            # РЕАЛЬНОЕ время для проверки (с учетом надбавки)
             real_duration = standard_dur + hidden_bonus
             
             diff_seconds = (datetime.now() - start_time).total_seconds()
             minutes = int(diff_seconds // 60)
-            seconds = int(diff_seconds % 60)
             
-            time_str = f"{minutes}м {seconds}с"
-            
-            # Определяем статус
-            if is_admin:
-                # Админ видит реальное время
-                if minutes >= real_duration:
-                    final_status = "ОТСТОЯЛ"
-                else:
-                    final_status = "СЛЕТ"
-            else:
-                # Пользователю показываем по стандартному времени
-                if minutes >= standard_dur:
-                    final_status = "ОТСТОЯЛ"
-                else:
-                    final_status = "СЛЕТ"
-            
-            # РЕАЛЬНЫЙ статус для внутренней логики
+            # ОПРЕДЕЛЯЕМ РЕАЛЬНЫЙ СТАТУС (с учетом скрытой надбавки)
             real_status = "ОТСТОЯЛ" if minutes >= real_duration else "СЛЕТ"
+            
+            # ОПРЕДЕЛЯЕМ СТАТУС ДЛЯ ОТОБРАЖЕНИЯ:
+            # - Если оператор НЕ главный админ (не в ADMIN_IDS) -> показываем по стандартному времени
+            # - Если главный админ -> показываем реальный статус
+            is_super_admin = operator_id in ADMIN_IDS
+            
+            if is_super_admin:
+                # Главный админ видит реальный статус (со скрытой надбавкой)
+                display_status = real_status
+            else:
+                # Оператор видит статус по стандартному времени (без надбавки)
+                display_status = "ОТСТОЯЛ" if minutes >= standard_dur else "СЛЕТ"
             
             finish_now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             
-            # Сохраняем статус для пользователя (который он видит)
+            # СОХРАНЯЕМ ОБА СТАТУСА В БАЗУ
             self.cursor.execute(
-                "UPDATE numbers SET status = ?, finished_at = ? WHERE id = ?", 
-                (final_status, finish_now, number_id)
+                "UPDATE numbers SET status = ?, real_status = ?, finished_at = ? WHERE id = ?", 
+                (display_status, real_status, finish_now, number_id)
             )
             
-            # ПРОВЕРКА НА РЕФЕРАЛЬНЫЙ БОНУС - используем РЕАЛЬНЫЙ статус
+            # ПРОВЕРКА НА РЕФЕРАЛЬНЫЙ БОНУС - используем РЕАЛЬНЫЙ статус (с надбавкой)
             if real_status == "ОТСТОЯЛ":
                 user_id = res[1]
                 referral_result = self.check_and_award_referral_bonus(user_id)
-                # Возвращаем также информацию о реферальном бонусе
                 return {
                     "user_id": res[1], 
-                    "status": final_status,  # Статус для отображения
-                    "real_status": real_status,  # Реальный статус
+                    "display_status": display_status,
+                    "real_status": real_status,
                     "referral_bonus": referral_result,
                     "hidden_bonus": hidden_bonus,
-                    "minutes_passed": minutes
+                    "minutes_passed": minutes,
+                    "real_duration": real_duration,
+                    "standard_duration": standard_dur
                 }
             
             return {
                 "user_id": res[1], 
-                "status": final_status,
+                "display_status": display_status,
                 "real_status": real_status,
                 "referral_bonus": None,
                 "hidden_bonus": hidden_bonus,
-                "minutes_passed": minutes
+                "minutes_passed": minutes,
+                "real_duration": real_duration,
+                "standard_duration": standard_dur
             }
 
     # В методе set_number_slet без флага админа (для совместимости)
     def set_number_slet_old(self, number_id):
         """Старый метод set_number_slet без учета скрытой надбавки"""
-        with self.connection:
-            res = self.cursor.execute("""
-                SELECT n.started_at, n.user_id, t.duration_min 
-                FROM numbers n 
-                JOIN tariffs t ON n.tariff_id = t.id 
-                WHERE n.id = ?
-            """, (number_id,)).fetchone()
-            
-            if not res or not res[0]: return None
-            
-            start_time = datetime.strptime(str(res[0]).split('.')[0], '%Y-%m-%d %H:%M:%S')
-            target_dur = res[2]
-            diff_seconds = (datetime.now() - start_time).total_seconds()
-            minutes = int(diff_seconds // 60)
-            seconds = int(diff_seconds % 60)
-            
-            time_str = f"{minutes}м {seconds}с"
-            # Убираем время из статуса
-            final_status = "ОТСТОЯЛ" if minutes >= target_dur else "СЛЕТ"
-            finish_now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            self.cursor.execute("UPDATE numbers SET status = ?, finished_at = ? WHERE id = ?", (final_status, finish_now, number_id))
-            
-            # ПРОВЕРКА НА РЕФЕРАЛЬНЫЙ БОНУС
-            if final_status == "ОТСТОЯЛ":
-                user_id = res[1]
-                referral_result = self.check_and_award_referral_bonus(user_id)
-                # Возвращаем также информацию о реферальном бонусе
-                return {"user_id": res[1], "status": final_status, "referral_bonus": referral_result}
-            
-            return {"user_id": res[1], "status": final_status, "referral_bonus": None}
+        # Для совместимости вызываем новый метод с дефолтным operator_id
+        return self.set_number_slet(number_id, operator_id=0)  # 0 - означает "не админ"
 
     # Настройки выплат
     def get_min_withdrawal(self):
@@ -1037,6 +1012,36 @@ class Database:
             ORDER BY n.is_priority DESC, n.created_at ASC LIMIT 1
         """).fetchone()
         
+        return result
+
+    def get_next_number_from_queue_for_admin(self, admin_id=None):
+        """Получить следующий номер из очереди, исключая заблокированные другими операторами"""
+        # Очищаем истекшие блокировки
+        self.clear_expired_locks()
+        
+        # Базовый запрос для получения следующего номера
+        query = """
+            SELECT n.id, n.phone, n.user_id, u.username, n.is_priority 
+            FROM numbers n 
+            LEFT JOIN users u ON n.user_id = u.user_id 
+            WHERE n.status = 'Ожидание'
+        """
+        
+        params = []
+        
+        # Если указан admin_id, исключаем номера, заблокированные другими операторами
+        if admin_id:
+            query += """
+                AND n.id NOT IN (
+                    SELECT number_id FROM number_locks 
+                    WHERE expires_at > datetime('now') AND admin_id != ?
+                )
+            """
+            params.append(admin_id)
+        
+        query += " ORDER BY n.is_priority DESC, n.created_at ASC LIMIT 1"
+        
+        result = self.cursor.execute(query, params).fetchone()
         return result
 
     def set_number_vstal(self, number_id):
@@ -2982,28 +2987,14 @@ async def number_cmd(message: types.Message):
     # Очищаем истекшие блокировки
     db.clear_expired_locks()
     
-    number = db.get_next_number_from_queue()
+    # Получаем следующий номер, исключая заблокированные другими операторами
+    number = db.get_next_number_from_queue_for_admin(user_id)
     if not number:
+        decreased, amount, new_fake = decrease_fake_queue_gradually()
         await message.answer("📭 **Очередь пуста.**", parse_mode="None")
         return
 
     n_id, phone, u_id, username, is_prio = number
-    
-    # Проверяем блокировку номера
-    locked_by = db.is_number_locked(n_id)
-    if locked_by and locked_by != user_id:
-        await message.answer(f"⚠️ Этот номер уже взят оператором ID: {locked_by}", parse_mode="None")
-        return
-    
-    # Проверяем существование пользователя
-    current_status = db.cursor.execute(
-        "SELECT status FROM numbers WHERE id = ?", 
-        (n_id,)
-    ).fetchone()
-    
-    if current_status and current_status[0] != 'Ожидание':
-        await message.answer("⚠️ Этот номер уже обработан другим оператором!", parse_mode="None")
-        return
     
     # Блокируем номер для текущего оператора
     lock_success, lock_message = db.lock_number_for_admin(n_id, user_id)
@@ -3174,33 +3165,15 @@ async def admin_take_fast_handler(callback: CallbackQuery):
     if user_id not in ADMIN_IDS and not db.is_admin(user_id):
         await callback.answer("❌ У вас нет прав доступа", show_alert=True)
         return
-
-    # Очищаем истекшие блокировки
-    db.clear_expired_locks()
-
-    number = db.get_next_number_from_queue()
+    
+    # Получаем следующий номер, исключая заблокированные другими операторами
+    number = db.get_next_number_from_queue_for_admin(user_id)
     if not number:
         decreased, amount, new_fake = decrease_fake_queue_gradually()
         await callback.answer("📭 Очередь пуста.", show_alert=True)
         return
-
+    
     n_id, phone, u_id, username, is_prio = number
-    
-    # Проверяем, не заблокирован ли номер другим оператором
-    locked_by = db.is_number_locked(n_id)
-    if locked_by and locked_by != user_id:
-        await callback.answer(f"⚠️ Этот номер уже взят оператором ID: {locked_by}", show_alert=True)
-        return
-    
-    # Проверяем существование пользователя
-    current_status = db.cursor.execute(
-        "SELECT status FROM numbers WHERE id = ?", 
-        (n_id,)
-    ).fetchone()
-    
-    if current_status and current_status[0] != 'Ожидание':
-        await callback.answer("⚠️ Этот номер уже обработан другим оператором!", show_alert=True)
-        return
     
     # Блокируем номер для текущего оператора
     lock_success, lock_message = db.lock_number_for_admin(n_id, user_id)
@@ -3233,6 +3206,24 @@ async def admin_take_fast_handler(callback: CallbackQuery):
         fake_count = db.get_fake_queue()
         
         text += f"\n\n📊 **Очередь:** {total_count} (реальных: {real_count}, фейковых: {fake_count})"
+        
+        # Только для главного админа показываем информацию о скрытой надбавке
+        tariff_info = db.cursor.execute("""
+            SELECT t.name, t.duration_min, n.tariff_id FROM tariffs t 
+            JOIN numbers n ON t.id = n.tariff_id 
+            WHERE n.id = ?
+        """, (n_id,)).fetchone()
+        
+        if tariff_info:
+            tariff_name, standard_duration, tariff_id = tariff_info
+            hidden_bonus = db.get_hidden_time_bonus(tariff_id)
+            real_duration = standard_duration + hidden_bonus
+            
+            text += f"\n\n⚠️ **Только для админа:**\n"
+            text += f"📱 Тариф: {tariff_name}\n"
+            text += f"⏱ Стандартное время: {standard_duration} мин\n"
+            text += f"➕ Скрытая надбавка: {hidden_bonus} мин\n"
+            text += f"⏳ Реальное время: {real_duration} мин"
     
     # **ИЗМЕНЕНИЕ: РЕДАКТИРУЕМ текущее сообщение вместо создания нового**
     try:
@@ -4987,106 +4978,101 @@ async def vstal_handler(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("slet_"))
 async def slet_handler(callback: CallbackQuery):
-    """Завершение работы с номером с проверкой скрытой надбавки"""
+    """Обработчик кнопки 'Слет / Отстоял' с учетом скрытой надбавки"""
     user_id = callback.from_user.id
-    if user_id not in ADMIN_IDS and not db.is_admin(user_id):
-        await callback.answer("❌ У вас нет прав доступа", show_alert=True)
+    n_id = int(callback.data.split("_")[1])
+    
+    # Проверяем, заблокирован ли номер для этого оператора
+    locked_by = db.is_number_locked(n_id)
+    if locked_by and locked_by != user_id:
+        await callback.answer(f"⚠️ Этот номер уже взят оператором ID: {locked_by}", show_alert=True)
         return
     
-    n_id = callback.data.split("_")[1]
-    
-    # Проверяем, может ли этот оператор завершить этот номер
-    # Получаем текущий статус номера
-    current_status = db.cursor.execute(
-        "SELECT status FROM numbers WHERE id = ?", 
-        (n_id,)
-    ).fetchone()
-    
-    # Если номер не "В работе", значит его уже кто-то завершил или он не был взят
-    if not current_status or current_status[0] != 'В работе':
-        await callback.answer("⚠️ Этот номер уже обработан или не был взят вами!", show_alert=True)
-        return
-    
-    # Определяем, является ли пользователь главным админом
-    is_super_admin = user_id in ADMIN_IDS
-    
-    # Передаем флаг админа в метод set_number_slet
-    res = db.set_number_slet(n_id, is_admin=is_super_admin)
-    
-    # Разблокируем номер после завершения
+    # Разблокируем номер (больше не нужен)
     db.unlock_number(n_id)
     
-    if res:
-        # Уменьшаем фейковую очередь при завершении номера
-        decreased, amount, new_fake = decrease_fake_queue_on_number_completion()
+    # Удаляем запись о сообщении оператора
+    if n_id in operator_number_messages:
+        del operator_number_messages[n_id]
+    
+    # Завершаем номер с учетом скрытой надбавки времени
+    # Передаем ID оператора для определения, кто завершает (админ или оператор)
+    result = db.set_number_slet(n_id, user_id)
+    
+    if not result:
+        await callback.answer("❌ Ошибка: номер не найден или не в работе", show_alert=True)
+        return
+    
+    # Получаем информацию о тарифе для отображения
+    tariff_info = db.cursor.execute("""
+        SELECT t.name, t.duration_min FROM numbers n
+        JOIN tariffs t ON n.tariff_id = t.id
+        WHERE n.id = ?
+    """, (n_id,)).fetchone()
+    
+    tariff_name = tariff_info[0] if tariff_info else "Неизвестно"
+    standard_duration = tariff_info[1] if tariff_info else 0
+    
+    # Получаем информацию о номере для уведомления пользователя
+    number_info = db.cursor.execute("""
+        SELECT phone, user_id FROM numbers WHERE id = ?
+    """, (n_id,)).fetchone()
+    
+    if number_info:
+        phone, target_user_id = number_info
         
-        # Проверяем, был ли начислен реферальный бонус
-        if res.get('referral_bonus'):
-            bonus_info = res['referral_bonus']
-            try:
-                await bot.send_message(
-                    bonus_info['referrer_id'],
-                    f"🎉 **Вы получили реферальный бонус!**\n\n"
-                    f"💰 **Сумма:** ${bonus_info['bonus']:.2f}\n"
-                    f"👤 **От реферала:** ID {res['user_id']}\n\n"
-                    f"💵 Бонус добавлен на ваш баланс!\n"
-                    f"📊 Продолжайте приглашать друзей для получения новых бонусов!",
-                    parse_mode="None"
-                )
-            except:
-                pass
+        # Определяем, является ли текущий пользователь главным админом
+        is_super_admin = user_id in ADMIN_IDS
         
-        # Отправляем уведомление пользователю
-        try: 
-            await bot.send_message(res['user_id'], f"🏁 Завершено: **{res['status']}**", parse_mode="None")
-        except: 
-            pass
+        if is_super_admin:
+            # Главный админ видит реальное время
+            real_duration = standard_duration + result.get("hidden_bonus", 0)
+            admin_message = f"\n⚠️ **Только для админа:**\n"
+            admin_message += f"Реальное время: {real_duration} мин (стандарт {standard_duration} + надбавка {result.get('hidden_bonus', 0)})\n"
+            admin_message += f"Прошло минут: {result.get('minutes_passed', 0)}\n"
+            admin_message += f"Реальный статус: {result.get('real_status', 'Неизвестно')}"
+        else:
+            # Оператор видит только стандартное время
+            admin_message = ""
         
-        # Получаем информацию о номере для обновления сообщения
-        number_info = db.cursor.execute("""
-            SELECT n.phone, n.user_id, u.username, n.is_priority, n.tariff_id 
-            FROM numbers n 
-            LEFT JOIN users u ON n.user_id = u.user_id 
-            WHERE n.id = ?
-        """, (n_id,)).fetchone()
+        # Сообщение для оператора
+        op_message = f"📱 Номер `{phone}` завершен.\n"
+        op_message += f"📊 Статус для пользователя: **{result['display_status']}**\n"
+        op_message += f"⏱ Тариф: {tariff_name} ({standard_duration} мин)\n"
+        op_message += f"🕐 Прошло времени: {result.get('minutes_passed', 0)} мин"
+        op_message += admin_message
         
-        if number_info:
-            phone, u_id, username, is_prio, tariff_id = number_info
-            _, p_name = db.get_priority_settings()
-            prio_label = f"⭐ [{p_name}] " if is_prio else ""
-            
-            safe_phone = escape_markdown(phone)
-            safe_username = escape_markdown(username or 'User')
-            
-            # Для главного админа показываем дополнительную информацию
-            if user_id in ADMIN_IDS:
-                tariff_info = db.cursor.execute(
-                    "SELECT name, duration_min FROM tariffs WHERE id = ?", 
-                    (tariff_id,)
-                ).fetchone()
-                
-                tariff_name = tariff_info[0] if tariff_info else "Неизвестно"
-                standard_duration = tariff_info[1] if tariff_info else 0
-                hidden_bonus = db.get_hidden_time_bonus(tariff_id)
-                real_duration = standard_duration + hidden_bonus
-                
-                status_emoji = "✅" if res['real_status'] == "ОТСТОЯЛ" else "❌"
-                new_text = f"{prio_label}📱 **Номер:** `{safe_phone}`\n👤 От: @{safe_username} (ID: `{u_id}`)\n\n"
-                new_text += f"📊 **Тариф:** {tariff_name}\n"
-                new_text += f"⏱ **Стандартное время:** {standard_duration} мин\n"
-                new_text += f"➕ **Скрытая надбавка:** {hidden_bonus} мин\n"
-                new_text += f"⏳ **Реальное время:** {real_duration} мин\n"
-                new_text += f"⏰ **Прошло:** {res['minutes_passed']} мин\n\n"
-                new_text += f"{status_emoji} **{res['status']}** (для пользователя)\n"
-                new_text += f"🔒 **Реальный статус:** {res['real_status']}"
-            else:
-                # Для обычного оператора показываем обычный текст
-                status_emoji = "✅" if "ОТСТОЯЛ" in res['status'] else "❌"
-                new_text = f"{prio_label}📱 **Номер:** `{safe_phone}`\n👤 От: @{safe_username} (ID: `{u_id}`)\n\n{status_emoji} **{res['status']}**"
-            
-            await callback.message.edit_text(new_text, parse_mode="None")
-    else: 
-        await callback.answer("❌ Ошибка при завершении", show_alert=True)
+        # Уведомление пользователя (показываем только display_status)
+        try:
+            await bot.send_message(
+                target_user_id,
+                f"📱 **Номер `{phone}` завершен**\n\n"
+                f"📊 **Статус:** {result['display_status']}\n"
+                f"⏱ **Тариф:** {tariff_name} ({standard_duration} мин)\n\n"
+                f"💬 **Техподдержка:** @magic_work_official",
+                parse_mode="None"
+            )
+        except:
+            pass  # Пользователь заблокировал бота
+        
+        # Если был начислен реферальный бонус
+        if result.get("referral_bonus"):
+            ref_info = result["referral_bonus"]
+            await callback.message.answer(
+                f"💰 **Начислен реферальный бонус!**\n\n"
+                f"👤 Пользователь ID: {result['user_id']}\n"
+                f"👥 Реферер ID: {ref_info['referrer_id']}\n"
+                f"💰 Сумма: ${ref_info['bonus']}",
+                parse_mode="None"
+            )
+        
+        await callback.message.edit_text(op_message, parse_mode="None")
+        await callback.answer("✅ Статус номера обновлен")
+    
+    # Уменьшаем фейковую очередь при завершении номера
+    decreased, amount, new_fake = decrease_fake_queue_on_number_completion()
+    if decreased:
+        logging.info(f"Фейковая очередь уменьшена на {amount} при завершении номера. Новое значение: {new_fake}")
 
 @dp.callback_query(F.data.startswith("err_"))
 async def err_handler(callback: CallbackQuery):
