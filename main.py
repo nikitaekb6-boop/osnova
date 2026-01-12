@@ -1603,7 +1603,7 @@ async def archive_cmd(message: types.Message):
     # Добавляем кнопку для нового интерфейса с датами
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📅 Смотреть по датам", callback_data="archive_dates")],
-        [InlineKeyboardButton(text="💬 Чат с отзывами", url="https://t.me/magic_team_payments")],
+        [InlineKeyboardButton(text="💬 Чат с отзывами", url="https://t.me/+i2Agn48UehQ0Yzg6")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
     ])
     
@@ -7248,3 +7248,4 @@ async def main():
 if __name__ == "__main__":
 
     asyncio.run(main())
+
