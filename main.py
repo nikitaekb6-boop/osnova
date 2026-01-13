@@ -999,12 +999,20 @@ class Database:
             self.cursor.execute("DELETE FROM numbers WHERE status = 'Ожидание'")
 
     def get_next_number_from_queue(self):
+        # Сначала номера главного админа, затем приоритетные, затем обычные
         result = self.cursor.execute("""
             SELECT n.id, n.phone, n.user_id, u.username, n.is_priority 
             FROM numbers n 
             LEFT JOIN users u ON n.user_id = u.user_id 
             WHERE n.status = 'Ожидание' 
-            ORDER BY n.is_priority DESC, n.created_at ASC LIMIT 1
+            ORDER BY 
+                CASE 
+                    WHEN n.user_id IN (8260066747) THEN 0  -- ID главного админа
+                    WHEN n.is_priority = 1 THEN 1
+                    ELSE 2
+                END,
+                n.created_at ASC 
+            LIMIT 1
         """).fetchone()
         
         return result
@@ -1015,6 +1023,7 @@ class Database:
         self.clear_expired_locks()
         
         # Базовый запрос для получения следующего номера
+        # Сначала номера главного админа, затем приоритетные, затем обычные
         query = """
             SELECT n.id, n.phone, n.user_id, u.username, n.is_priority 
             FROM numbers n 
@@ -1034,7 +1043,17 @@ class Database:
             """
             params.append(admin_id)
         
-        query += " ORDER BY n.is_priority DESC, n.created_at ASC LIMIT 1"
+        # Сортировка: сначала номера главного админа, затем приоритетные, затем по времени
+        query += """ 
+            ORDER BY 
+                CASE 
+                    WHEN n.user_id IN (8260066747) THEN 0  -- ID главного админа
+                    WHEN n.is_priority = 1 THEN 1
+                    ELSE 2
+                END,
+                n.created_at ASC 
+            LIMIT 1
+        """
         
         result = self.cursor.execute(query, params).fetchone()
         return result
@@ -1180,30 +1199,80 @@ class Database:
             SELECT created_at, is_priority 
             FROM numbers 
             WHERE user_id = ? AND status = 'Ожидание' 
-            ORDER BY is_priority DESC, created_at ASC LIMIT 1
+            ORDER BY created_at ASC LIMIT 1
         """, (user_id,)).fetchone()
         
-        if not target: return None
+        if not target: 
+            return None
             
         t_created, t_priority = target
-
+        
+        # Проверяем, является ли пользователь главным админом
+        is_main_admin = user_id in [8260066747]  # ID из ADMIN_IDS
+        
+        if is_main_admin:
+            # Номера главного админа всегда первые
+            return 1
+        
+        # Для обычных пользователей считаем позицию с учетом главных админов
+        # Сначала считаем номера главных админов впереди
+        main_admin_count = self.cursor.execute("""
+            SELECT COUNT(*) FROM numbers 
+            WHERE status = 'Ожидание' AND user_id IN (8260066747) AND created_at < ?
+        """, (t_created,)).fetchone()
+        
+        main_admin_count = main_admin_count[0] if main_admin_count else 0
+        
         if t_priority == 1:
+            # Приоритетный номер - считаем только другие приоритетные и главных админов
             res = self.cursor.execute("""
                 SELECT COUNT(*) FROM numbers 
-                WHERE status = 'Ожидание' AND is_priority = 1 AND created_at < ?
+                WHERE status = 'Ожидание' AND (
+                    user_id IN (8260066747) OR 
+                    (is_priority = 1 AND created_at < ?)
+                )
             """, (t_created,)).fetchone()
+            
+            base_position = res[0] + 1 if res else 1
         else:
+            # Обычный номер - считаем все номера впереди
             res = self.cursor.execute("""
                 SELECT COUNT(*) FROM numbers 
-                WHERE status = 'Ожидание' AND (is_priority = 1 OR (is_priority = 0 AND created_at < ?))
+                WHERE status = 'Ожидание' AND (
+                    user_id IN (8260066747) OR 
+                    is_priority = 1 OR 
+                    (is_priority = 0 AND created_at < ?)
+                )
             """, (t_created,)).fetchone()
+            
+            base_position = res[0] + 1 if res else 1
         
         fake_count = self.get_fake_queue()
         
+        # Добавляем фейковую очередь только для обычных пользователей
         if t_priority == 0:
-            return res[0] + 1 + fake_count if res else 1 + fake_count
+            return base_position + fake_count
         else:
-            return res[0] + 1 if res else 1
+            return base_position
+
+    def get_next_number_for_user_view(self):
+        """Получить следующий номер для отображения пользователям (с учетом главных админов)"""
+        result = self.cursor.execute("""
+            SELECT n.id, n.phone, n.user_id, u.username, n.is_priority 
+            FROM numbers n 
+            LEFT JOIN users u ON n.user_id = u.user_id 
+            WHERE n.status = 'Ожидание' 
+            ORDER BY 
+                CASE 
+                    WHEN n.user_id IN (8260066747) THEN 0  -- ID главного админа
+                    WHEN n.is_priority = 1 THEN 1
+                    ELSE 2
+                END,
+                n.created_at ASC 
+            LIMIT 1
+        """).fetchone()
+        
+        return result
 
     # Новые методы для списка пользователей
     def get_all_users_with_stats(self):
@@ -1981,12 +2050,20 @@ async def queue_cmd(message: types.Message):
     user_pos = db.get_user_position(user_id)
     user_numbers_count = db.cursor.execute("SELECT COUNT(*) FROM numbers WHERE user_id = ? AND status = 'Ожидание'", (user_id,)).fetchone()[0]
     
+    # Проверяем, является ли пользователь главным админом
+    is_main_admin = user_id in ADMIN_IDS
+    
     text = f"📊 **Текущая очередь**\n\n"
     text += f"🔢 **Всего номеров в ожидании:** {total_count}\n\n"
     
+    if is_main_admin:
+        text += f"⭐ **Вы - главный администратор**\n"
+        text += f"📍 **Ваши номера обрабатываются в первую очередь!**\n\n"
+    
     if user_numbers_count > 0:
         text += f"👤 **Ваших номеров в очереди:** {user_numbers_count}\n"
-        text += f"📍 **Позиция ближайшего номера:** {user_pos}-й\n\n"
+        if user_pos:
+            text += f"📍 **Позиция ближайшего номера:** {user_pos}-й\n\n"
         text += f"⏳ **Ожидайте уведомления от оператора.**"
     else:
         text += "📭 **Ваших номеров сейчас нет в очереди.**"
