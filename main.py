@@ -1428,7 +1428,7 @@ def get_main_menu(user_id=None):
         [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile")],
         [InlineKeyboardButton(text="👥 Реферальная система", callback_data="referral_system")],
         [InlineKeyboardButton(text="💰 Тарифы", callback_data="show_tariffs")],
-        [InlineKeyboardButton(text="📞 Техподдержка", url="https://t.me/t.me/magic_team_support")]
+        [InlineKeyboardButton(text="📞 Техподдержка", url="https://t.me/magic_team_support")]
     ]
     
     if system_message:
@@ -7317,6 +7317,7 @@ async def main():
 if __name__ == "__main__":
 
     asyncio.run(main())
+
 
 
 
