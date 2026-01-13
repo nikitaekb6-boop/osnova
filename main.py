@@ -1413,7 +1413,7 @@ def get_main_menu(user_id=None):
             [InlineKeyboardButton(text="❌ Система временно закрыта", callback_data="system_closed_info")],
             [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile")],
             [InlineKeyboardButton(text="📂 Архив", callback_data="archive")],
-            [InlineKeyboardButton(text="📞 Техподдержка", url="https://t.me/magic_work_official")]
+            [InlineKeyboardButton(text="📞 Техподдержка", url="https://t.me/magic_team_support")]
         ])
     
     # Получаем количество активных номеров, если передан user_id
@@ -1428,7 +1428,7 @@ def get_main_menu(user_id=None):
         [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile")],
         [InlineKeyboardButton(text="👥 Реферальная система", callback_data="referral_system")],
         [InlineKeyboardButton(text="💰 Тарифы", callback_data="show_tariffs")],
-        [InlineKeyboardButton(text="📞 Техподдержка", url="https://t.me/magic_work_official")]
+        [InlineKeyboardButton(text="📞 Техподдержка", url="https://t.me/t.me/magic_team_support")]
     ]
     
     if system_message:
@@ -2292,7 +2292,7 @@ async def help_cmd(message: types.Message):
         "• /ref - Реферальная система\n"
         "• /myactive - Проверить активный номер\n"
         "• /help - Эта справка\n\n"
-        "📞 **Техподдержка:** @magic_work_official\n\n"
+        "📞 **Техподдержка:** @magic_team_support\n\n"
         "⚡ **Быстрые действия через кнопки:**\n"
         "Используйте кнопки меню для быстрого доступа ко всем функциям!"
     )
@@ -5118,7 +5118,7 @@ async def slet_handler(callback: CallbackQuery):
                 f"📱 **Номер `{phone}` завершен**\n\n"
                 f"📊 **Статус:** {result['display_status']}\n"
                 f"⏱ **Тариф:** {tariff_name} ({standard_duration} мин)\n\n"
-                f"💬 **Техподдержка:** @magic_work_official",
+                f"💬 **Техподдержка:** @magic_team_support",
                 parse_mode="None"
             )
         except:
@@ -7317,5 +7317,6 @@ async def main():
 if __name__ == "__main__":
 
     asyncio.run(main())
+
 
 
