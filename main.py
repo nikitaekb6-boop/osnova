@@ -449,7 +449,7 @@ class Database:
 
     def get_referral_link(self, user_id):
         """Сгенерировать реферальную ссылку"""
-        bot_username = "Magic_team_work_bot"  # Нужно будет заменить
+        bot_username = "magic_team_new_bot"  # Нужно будет заменить
         return f"https://t.me/{bot_username}?start=ref{user_id}"
 
     def get_all_referral_stats_admin(self):
@@ -1366,7 +1366,7 @@ class Database:
 
 # --- КОНФИГУРАЦИЯ БОТА ---
 
-TOKEN = "8168150477:AAGX0s9L3KTIBB0X-wuFke7AIVUPcXaBigU"
+TOKEN = "8251033217:AAGFX2_ceJs1bxx3eyXdYaDpD1diiDFoCmo"
 ADMIN_IDS = [8260066747] 
 PAYMENT_LOG_CHANNEL = -1003653802196  # ID канала с выплатами
 
