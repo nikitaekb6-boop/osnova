@@ -1255,6 +1255,27 @@ class Database:
         else:
             return base_position
 
+    def remove_user_number_from_queue(self, user_id, phone):
+        """Удалить номер пользователя из очереди"""
+        with self.connection:
+            # Проверяем, существует ли номер у пользователя в очереди
+            result = self.cursor.execute("""
+                SELECT id, status FROM numbers 
+                WHERE user_id = ? AND phone = ? AND status = 'Ожидание'
+            """, (user_id, phone)).fetchone()
+            
+            if not result:
+                return False, "Номер не найден в вашей очереди"
+            
+            number_id, status = result
+            
+            if status != 'Ожидание':
+                return False, "Номер уже обрабатывается или завершен"
+            
+            # Удаляем номер из очереди
+            self.cursor.execute("DELETE FROM numbers WHERE id = ?", (number_id,))
+            return True, "Номер успешно удален из очереди"
+
     def get_next_number_for_user_view(self):
         """Получить следующий номер для отображения пользователям (с учетом главных админов)"""
         result = self.cursor.execute("""
@@ -1400,6 +1421,8 @@ class Form(StatesGroup):
     waiting_for_user_date_selection = State()  # Выбор даты пользователем для архива
     # Состояние для повторной отправки фото
     waiting_for_repeat_reply = State()
+    # Состояние для удаления номера
+    waiting_for_remove_phone = State()
 
 # --- КЛАВИАТУРЫ ---
 
@@ -2516,15 +2539,143 @@ async def check_active_number_handler(callback: CallbackQuery):
     text += "⏳ *Ожидайте уведомления от оператора.*\n\n"
     text += "⚠️ *Правила:*\n"
     text += "• Можно сдавать несколько разных номеров\n"
-    text += "• Приоритетные номера (⭐) обрабатываются в первую очередь"
+    text += "• Приоритетные номера (⭐) обрабатываются в первую очередь\n"
+    text += "• Вы можете удалить номер из очереди, если передумали"
     
     buttons = [
+        [InlineKeyboardButton(text="❌ Удалить номер из очереди", callback_data="remove_number_start")],
         [InlineKeyboardButton(text="📱 Сдать еще номер", callback_data="give_number")],
         [InlineKeyboardButton(text="📊 Проверить очередь", callback_data="queue")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="profile")]
     ]
     
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="None")
+
+@dp.callback_query(F.data == "remove_number_start")
+async def remove_number_start_handler(callback: CallbackQuery, state: FSMContext):
+    """Начать процесс удаления номера"""
+    if db.is_user_banned(callback.from_user.id): 
+        return
+    
+    # Получаем активные номера пользователя
+    active_numbers = db.cursor.execute(
+        "SELECT phone FROM numbers WHERE user_id = ? AND status = 'Ожидание'",
+        (callback.from_user.id,)
+    ).fetchall()
+    
+    if not active_numbers:
+        await callback.answer("📭 У вас нет номеров в очереди для удаления", show_alert=True)
+        return
+    
+    # Создаем клавиатуру с номерами для удаления
+    buttons = []
+    for phone, in active_numbers[:10]:  # Ограничиваем 10 номерами
+        safe_phone = escape_markdown(phone)
+        buttons.append([
+            InlineKeyboardButton(text=f"📱 {phone[:10]}...", callback_data=f"remove_confirm_{phone}")
+        ])
+    
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="check_active_number")])
+    
+    await callback.message.edit_text(
+        "❌ **Удаление номера из очереди**\n\n"
+        "Выберите номер для удаления:\n\n"
+        "⚠️ *Внимание:* После удаления номер нельзя будет восстановить.\n"
+        "Позиция других ваших номеров в очереди может измениться.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="None"
+    )
+
+@dp.callback_query(F.data.startswith("remove_confirm_"))
+async def remove_confirm_handler(callback: CallbackQuery):
+    """Подтверждение удаления номера"""
+    if db.is_user_banned(callback.from_user.id): 
+        return
+    
+    # Получаем номер из callback_data
+    phone = callback.data.replace("remove_confirm_", "")
+    
+    # Создаем клавиатуру подтверждения
+    buttons = [
+        [
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"remove_execute_{phone}"),
+            InlineKeyboardButton(text="❌ Нет, отмена", callback_data="remove_number_start")
+        ]
+    ]
+    
+    await callback.message.edit_text(
+        f"⚠️ **Подтверждение удаления**\n\n"
+        f"Вы действительно хотите удалить номер `{escape_markdown(phone)}` из очереди?\n\n"
+        f"*Это действие нельзя отменить!*",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="None"
+    )
+
+@dp.callback_query(F.data.startswith("remove_execute_"))
+async def remove_execute_handler(callback: CallbackQuery):
+    """Выполнение удаления номера"""
+    if db.is_user_banned(callback.from_user.id): 
+        return
+    
+    phone = callback.data.replace("remove_execute_", "")
+    
+    # Удаляем номер из очереди
+    success, message = db.remove_user_number_from_queue(callback.from_user.id, phone)
+    
+    if success:
+        # Уменьшаем фейковую очередь при удалении реального номера
+        decreased, amount, new_fake = decrease_fake_queue_on_number_taken()
+        
+        text = f"✅ **Номер удален**\n\n"
+        text += f"📱 `{escape_markdown(phone)}` успешно удален из очереди.\n"
+        text += "💰 *Средства не возвращаются.*\n\n"
+        text += "📊 **Обновите список активных номеров**"
+        
+        buttons = [
+            [InlineKeyboardButton(text="📋 Обновить список", callback_data="check_active_number")],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_to_main")]
+        ]
+    else:
+        text = f"❌ **Ошибка**\n\n{message}"
+        buttons = [
+            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="remove_number_start")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="check_active_number")]
+        ]
+    
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="None"
+    )
+
+@dp.message(Command("cancel"))
+async def cancel_cmd(message: types.Message, state: FSMContext):
+    """Отмена текущего действия"""
+    if db.is_user_banned(message.from_user.id): 
+        return
+    
+    current_state = await state.get_state()
+    
+    if current_state == Form.waiting_for_remove_phone:
+        await state.clear()
+        await message.answer(
+            "❌ Удаление номера отменено.",
+            reply_markup=get_main_menu(message.from_user.id),
+            parse_mode="None"
+        )
+    elif current_state:
+        await state.clear()
+        await message.answer(
+            "❌ Текущее действие отменено.",
+            reply_markup=get_main_menu(message.from_user.id),
+            parse_mode="None"
+        )
+    else:
+        await message.answer(
+            "ℹ️ Нет активных действий для отмены.",
+            reply_markup=get_main_menu(message.from_user.id),
+            parse_mode="None"
+        )
 
 # ============================================
 # ВЫВОД СРЕДСТВ - ПОЛЬЗОВАТЕЛЬСКИЙ ИНТЕРФЕЙС
