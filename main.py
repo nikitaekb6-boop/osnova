@@ -1366,7 +1366,7 @@ class Database:
 
 # --- КОНФИГУРАЦИЯ БОТА ---
 
-TOKEN = "8251033217:AAGFX2_ceJs1bxx3eyXdYaDpD1diiDFoCmo"
+TOKEN = "9135570169:AAG3ghDX0Zq831gi14d75vYErpiKAElUMyc"
 ADMIN_IDS = [8260066747] 
 PAYMENT_LOG_CHANNEL = -1003653802196  # ID канала с выплатами
 
